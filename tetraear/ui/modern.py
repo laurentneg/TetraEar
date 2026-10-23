@@ -339,7 +339,10 @@ class SettingsManager:
         "zoom_level": 1.0,
         "noise_floor": -85,
         "theme": "dark",
-        "expected_mcc": None
+        "expected_mcc": None,
+        "auto_spectrum": False,
+        "denoiser": False,
+        "follow_freq": False,
     }
     
     def __init__(self, filename="settings.json"):
@@ -475,6 +478,32 @@ class SettingsDialog(QDialog):
         audio_layout.addWidget(self.audio_device_combo)
         audio_group.setLayout(audio_layout)
         layout.addWidget(audio_group)
+
+        # Spectrum / display options (moved from Actions panel)
+        spectrum_group = QGroupBox("Spectrum")
+        spectrum_layout = QVBoxLayout()
+        spectrum_layout.setSpacing(10)
+
+        self.auto_spectrum_cb = QCheckBox("Auto Spectrum Sliders")
+        self.auto_spectrum_cb.setToolTip(
+            "Dynamically adjust zoom, top, bottom, and threshold based on live signal"
+        )
+        self.auto_spectrum_cb.setChecked(bool(self.settings.get("auto_spectrum", False)))
+        spectrum_layout.addWidget(self.auto_spectrum_cb)
+
+        self.denoiser_cb = QCheckBox("Denoiser (Smooth)")
+        self.denoiser_cb.setChecked(bool(self.settings.get("denoiser", False)))
+        spectrum_layout.addWidget(self.denoiser_cb)
+
+        self.follow_freq_cb = QCheckBox("Auto-Follow Spike (AFC)")
+        self.follow_freq_cb.setToolTip(
+            "Automatically adjust tuning to keep the main spike centered"
+        )
+        self.follow_freq_cb.setChecked(bool(self.settings.get("follow_freq", False)))
+        spectrum_layout.addWidget(self.follow_freq_cb)
+
+        spectrum_group.setLayout(spectrum_layout)
+        layout.addWidget(spectrum_group)
         
         # Appearance Settings
         app_group = QGroupBox("Appearance")
@@ -506,6 +535,9 @@ class SettingsDialog(QDialog):
         self.settings.set("save_silence", self.save_silence_cb.isChecked())
         self.settings.set("export_mp3", self.export_mp3_cb.isChecked())
         self.settings.set("audio_device", self.audio_device_combo.currentData())
+        self.settings.set("auto_spectrum", self.auto_spectrum_cb.isChecked())
+        self.settings.set("denoiser", self.denoiser_cb.isChecked())
+        self.settings.set("follow_freq", self.follow_freq_cb.isChecked())
         self.settings.set("theme", self.theme_combo.currentText())
         self.settings.save()
         self.accept()
@@ -515,7 +547,8 @@ class SettingsDialog(QDialog):
             QDialog { background-color: #0a0a0f; color: #fafafa; }
             QGroupBox { border: 1px solid #2a2a3a; border-radius: 8px; margin-top: 8px; padding: 12px; background-color: #1a1a24; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; color: #a1a1aa; }
-            QCheckBox { color: #fafafa; spacing: 8px; }
+            QCheckBox { color: #fafafa; spacing: 10px; font-size: 13px; min-height: 28px; padding: 4px 0; }
+            QCheckBox::indicator { width: 18px; height: 18px; }
             QPushButton { background-color: #1a1a24; color: #fafafa; border: 1px solid #2a2a3a; border-radius: 6px; padding: 8px 16px; }
             QPushButton:hover { background-color: #2a2a3a; }
         """)
@@ -2429,6 +2462,7 @@ class ModernTetraGUI(QMainWindow):
         self.scanner_dialog = None
         self.encryption_keys = []
         self.auto_spectrum_enabled = False
+        self.follow_freq_enabled = False
         self._last_auto_spectrum_time = 0.0
         
         # Filter data sets
@@ -2532,9 +2566,20 @@ class ModernTetraGUI(QMainWindow):
         self.auto_decrypt_cb.setChecked(s.get("auto_decrypt", True))
         self.hear_voice_cb.setChecked(s.get("monitor_audio", True))
         self.monitor_raw_cb.setChecked(s.get("monitor_raw", False))
+        self.apply_spectrum_settings()
         
         # Update presets
         self.update_presets()
+
+    def apply_spectrum_settings(self):
+        """Apply spectrum-related settings from SettingsManager."""
+        s = self.settings_manager
+        auto_spectrum = bool(s.get("auto_spectrum", False))
+        denoiser = bool(s.get("denoiser", False))
+        follow_freq = bool(s.get("follow_freq", False))
+        self.on_auto_spectrum_toggled(auto_spectrum)
+        self.on_denoiser_toggled(denoiser)
+        self.follow_freq_enabled = follow_freq
 
     def update_presets(self):
         """Update preset combo box."""
@@ -2547,8 +2592,7 @@ class ModernTetraGUI(QMainWindow):
         """Open settings dialog."""
         dlg = SettingsDialog(self.settings_manager, self)
         if dlg.exec():
-            # Apply settings immediately if needed
-            pass
+            self.apply_spectrum_settings()
 
     def save_current_freq(self):
         """Open save frequency dialog."""
@@ -2848,27 +2892,6 @@ class ModernTetraGUI(QMainWindow):
         button_row2.addWidget(about_btn, 1)
         
         button_layout.addLayout(button_row2)
-
-        # Moved Spectrum Display toggles here for easier access
-        toggles_layout = QVBoxLayout()
-        toggles_layout.setSpacing(4)
-
-        self.auto_spectrum_cb = QCheckBox("Auto Spectrum Sliders")
-        self.auto_spectrum_cb.setToolTip("Dynamically adjust zoom, top, bottom, and threshold based on live signal")
-        self.auto_spectrum_cb.toggled.connect(self.on_auto_spectrum_toggled)
-        toggles_layout.addWidget(self.auto_spectrum_cb)
-
-        self.denoiser_cb = QCheckBox("Denoiser (Smooth)")
-        self.denoiser_cb.toggled.connect(self.on_denoiser_toggled)
-        toggles_layout.addWidget(self.denoiser_cb)
-
-        # Auto frequency correction (spike locking)
-        self.follow_freq_cb = QCheckBox("Auto-Follow Spike (AFC)")
-        self.follow_freq_cb.setChecked(False)
-        self.follow_freq_cb.setToolTip("Automatically adjust tuning to keep the main spike centered")
-        toggles_layout.addWidget(self.follow_freq_cb)
-
-        button_layout.addLayout(toggles_layout)
         button_group.setLayout(button_layout)
         left_col.addWidget(button_group)
         
@@ -5045,7 +5068,7 @@ class ModernTetraGUI(QMainWindow):
             self.waterfall.set_tuned_frequency(freq_mhz)
             
             # Auto-follow frequency logic (AFC)
-            if hasattr(self, 'follow_freq_cb') and self.follow_freq_cb.isChecked():
+            if getattr(self, 'follow_freq_enabled', False):
                 # Find peak within +/- 10 kHz of current center frequency
                 # This ensures we stay locked to the TETRA channel
                 center_idx = np.abs(freqs - freq_mhz).argmin()
