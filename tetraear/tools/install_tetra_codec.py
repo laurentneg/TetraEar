@@ -145,20 +145,67 @@ def verify_md5(path: Path, expected: str) -> None:
     print("[+] Checksum OK")
 
 
+_TEXT_SUFFIXES = {
+    ".c",
+    ".h",
+    ".tab",
+    ".txt",
+    ".patch",
+    ".diff",
+    ".mk",
+}
+_TEXT_NAMES = {
+    "makefile",
+    "gnumakefile",
+    "series",
+    "readme",
+}
+
+
+def _should_normalize(path: Path) -> bool:
+    name = path.name.lower()
+    if name in _TEXT_NAMES:
+        return True
+    if path.suffix.lower() in _TEXT_SUFFIXES:
+        return True
+    return False
+
+
 def normalize_line_endings(root: Path) -> None:
+    """Force LF endings so GNU patch matches on Windows (zip often has CRLF)."""
     print("[*] Normalizing line endings (CRLF → LF)...")
+    converted = 0
     for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in {".c", ".h", ".tab"} and path.name.lower() not in {
-            "makefile",
-            "series",
-        }:
+        if not path.is_file() or not _should_normalize(path):
             continue
         try:
             data = path.read_bytes()
-            if b"\r\n" in data:
-                path.write_bytes(data.replace(b"\r\n", b"\n"))
+            if b"\r\n" not in data and b"\r" not in data:
+                continue
+            fixed = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if fixed != data:
+                path.write_bytes(fixed)
+                converted += 1
+        except OSError:
+            pass
+    print(f"  converted {converted} file(s)")
+
+
+def lowercase_etsi_tree(codec_dir: Path) -> None:
+    """Mimic `unzip -L`: lowercase paths so patches targeting c-code/ apply cleanly."""
+    # Rename deepest paths first
+    entries = sorted(codec_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True)
+    for path in entries:
+        if not path.exists():
+            continue
+        lower_name = path.name.lower()
+        if path.name == lower_name:
+            continue
+        dest = path.with_name(lower_name)
+        if dest.exists():
+            continue
+        try:
+            path.rename(dest)
         except OSError:
             pass
 
@@ -175,7 +222,8 @@ def fix_makefiles(root: Path) -> None:
         if "-fcommon" not in data:
             data = re.sub(r"(?m)^CFLAGS\s*=\s*(.*)$", r"CFLAGS = -fcommon \1", data)
         data = data.replace("-Werror", "")
-        path.write_text(data, encoding="utf-8")
+        # Always write LF on Windows so subsequent tools stay consistent
+        path.write_bytes(data.replace("\r\n", "\n").encode("utf-8"))
 
 
 def ensure_osmo(build_dir: Path) -> Path:
@@ -184,6 +232,23 @@ def ensure_osmo(build_dir: Path) -> Path:
         print(f"[*] Cloning osmo-tetra → {osmo}")
         run(["git", "clone", "--depth", "1", OSMO_URL, str(osmo)])
     return osmo
+
+
+def _apply_patch(patch_file: Path, codec_dir: Path) -> None:
+    """Apply one patch; prefer --binary to avoid MSYS CRLF mangling."""
+    data = patch_file.read_bytes()
+    if b"\r\n" in data or b"\r" in data:
+        data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        patch_file.write_bytes(data)
+
+    cmd = ["patch", "--batch", "-p1", "-d", str(codec_dir)]
+    # GNU patch: --binary disables newline translation (critical on Win/MSYS)
+    r = subprocess.run(cmd + ["--binary"], input=data, check=False)
+    if r.returncode == 0:
+        return
+    # Retry without --binary (older patch)
+    subprocess.run(cmd, input=data, check=True)
+
 
 
 def prepare_etsi_sources(osmo: Path, etsi_zip: Path) -> Path:
@@ -196,6 +261,11 @@ def prepare_etsi_sources(osmo: Path, etsi_zip: Path) -> Path:
     print(f"[*] Extracting ETSI sources → {codec_dir}")
     with zipfile.ZipFile(etsi_zip, "r") as zf:
         zf.extractall(codec_dir)
+
+    # Must happen BEFORE patches: Windows zip extract often leaves CRLF makefiles
+    lowercase_etsi_tree(codec_dir)
+    normalize_line_endings(codec_dir)
+    normalize_line_endings(patch_dir)
 
     series = patch_dir / "series"
     if not series.is_file():
@@ -210,10 +280,12 @@ def prepare_etsi_sources(osmo: Path, etsi_zip: Path) -> Path:
         if not patch_file.is_file():
             fail(f"Missing patch: {patch_file}")
         print(f"  patch {line}")
-        with open(patch_file, "rb") as pf:
-            subprocess.check_call(
-                ["patch", "--batch", "-p1", "-d", str(codec_dir)],
-                stdin=pf,
+        try:
+            _apply_patch(patch_file, codec_dir)
+        except subprocess.CalledProcessError as e:
+            fail(
+                f"patch failed for {line} (exit {e.returncode}). "
+                "Delete the build dir and retry, or set TETRAEAR_ETSI_ZIP to a clean zip."
             )
 
     normalize_line_endings(codec_dir)
