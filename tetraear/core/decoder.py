@@ -957,6 +957,8 @@ class TetraDecoder:
                 self.protocol_parser.mcc = self.lower_mac.mcc
             if self.lower_mac.mnc is not None:
                 self.protocol_parser.mnc = self.lower_mac.mnc
+            if self.lower_mac.colour_code is not None:
+                self.protocol_parser.colour_code = self.lower_mac.colour_code
 
             for block in blocks:
                 frame_data = {
@@ -967,14 +969,24 @@ class TetraDecoder:
                     "crc_ok": block.crc_ok,
                     "scrambling_code": block.scrambling_code,
                     "additional_info": {},
+                    "has_voice": False,
                 }
                 frame_number += 1
 
                 if block.type1_bits is not None:
                     frame_data["bits"] = block.type1_bits.tolist()
+                if block.type4_bits is not None and len(block.type4_bits) > 0:
+                    # Expose for debug / offline packing (hard 0/1 or soft)
+                    if not np.any((block.type4_bits != 0) & (block.type4_bits != 1)):
+                        frame_data["type4_bits"] = block.type4_bits.astype(np.uint8).tolist()
                 if block.codec_input:
-                    frame_data["has_voice"] = True
+                    # has_voice set True only after VoiceProcessor produces audible audio
                     frame_data["codec_input"] = block.codec_input
+                frame_data["is_traffic"] = bool(block.is_traffic)
+                if block.extra and "voice_verified" in block.extra:
+                    frame_data["voice_verified"] = bool(block.extra["voice_verified"])
+                else:
+                    frame_data["voice_verified"] = bool(block.is_traffic)
 
                 if block.extra:
                     frame_data["additional_info"].update(block.extra)
@@ -982,6 +994,8 @@ class TetraDecoder:
                         frame_data["mcc"] = block.extra["mcc"]
                     if "mnc" in block.extra:
                         frame_data["mnc"] = block.extra["mnc"]
+                    if "colour_code" in block.extra:
+                        frame_data["colour_code"] = block.extra["colour_code"]
 
                 if block.type1_bits is not None and block.block_type in (BlockType.NDB, BlockType.SCH_F, BlockType.SB2):
                     mac_pdu = self.protocol_parser.parse_mac_pdu(block.type1_bits, crc_ok=block.crc_ok)
@@ -995,6 +1009,9 @@ class TetraDecoder:
                         }
                         if mac_pdu.extra:
                             frame_data["mac_pdu_extra"] = mac_pdu.extra
+                            if mac_pdu.extra.get("location_area") is not None:
+                                frame_data["additional_info"]["location_area"] = mac_pdu.extra["location_area"]
+                                frame_data["location_area"] = mac_pdu.extra["location_area"]
                         frame_data["encrypted"] = mac_pdu.encrypted
 
                         call_meta = self.protocol_parser.parse_call_metadata(mac_pdu)
@@ -1010,6 +1027,14 @@ class TetraDecoder:
                                 "mcc": call_meta.mcc,
                                 "mnc": call_meta.mnc,
                             }
+                            # Mirror into additional_info for UI/log paths that
+                            # do not read call_metadata directly.
+                            if call_meta.talkgroup_id is not None:
+                                frame_data["additional_info"]["talkgroup"] = call_meta.talkgroup_id
+                            if call_meta.source_ssi is not None:
+                                frame_data["additional_info"]["source_ssi"] = call_meta.source_ssi
+                            if call_meta.dest_ssi is not None:
+                                frame_data["additional_info"]["dest_ssi"] = call_meta.dest_ssi
 
                 frames.append(frame_data)
 

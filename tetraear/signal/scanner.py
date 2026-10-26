@@ -41,18 +41,26 @@ class TetraSignalDetector:
         
     def calculate_power(self, samples: np.ndarray) -> float:
         """
-        Calculate signal power.
-        
-        Args:
-            samples: Complex IQ samples
-            
-        Returns:
-            Power in dB
+        Power in the center TETRA channel (±12.5 kHz), not the full RTL span.
+
+        Full-band mean |IQ|² is almost flat across the band (noise + bleed),
+        which made every scan step look the same.
         """
-        if samples.size == 0:
+        if samples is None or samples.size < 64:
             return float(self.bottom_threshold)
-        power = np.mean(np.abs(samples) ** 2)
-        return 10 * np.log10(power + 1e-10)  # Add small value to avoid log(0)
+        n = int(min(samples.size, 8192))
+        chunk = np.asarray(samples[:n], dtype=np.complex64)
+        chunk = chunk * np.hanning(n).astype(np.float32)
+        spec = np.fft.fftshift(np.fft.fft(chunk))
+        freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / float(self.sample_rate)))
+        half_bw = float(self.channel_bandwidth) * 0.5
+        mask = np.abs(freqs) <= half_bw
+        if not np.any(mask):
+            power = float(np.mean(np.abs(chunk) ** 2))
+        else:
+            # densite moyenne dans la bande canal
+            power = float(np.mean(np.abs(spec[mask]) ** 2) / (n * n))
+        return 10.0 * np.log10(power + 1e-20)
     
     def detect_tetra_modulation(self, samples: np.ndarray) -> Tuple[bool, float]:
         """
@@ -285,7 +293,9 @@ class TetraSignalDetector:
             'frames_validated': frames_valid,
             'crc_pass_rate': crc_rate,
             'power_stable': power_stable,
-            'signal_present': power > self.bottom_threshold  # Use bottom_threshold for signal presence
+            # Relative to configured noise floor (not bottom display scale).
+            # bottom_threshold (~-85) is almost always true on an RTL → false "signals".
+            'signal_present': power > (self.noise_floor + 6.0),
         }
 
 
@@ -322,6 +332,25 @@ class FrequencyScanner:
         self.detector = TetraSignalDetector(sample_rate, noise_floor=noise_floor, bottom_threshold=bottom_threshold)
         self.found_channels = []  # List of found TETRA channels
         
+    def _tune(self, frequency: float) -> None:
+        if hasattr(self.capture, "sdr") and self.capture.sdr:
+            self.capture.sdr.center_freq = frequency
+        elif hasattr(self.capture, "set_frequency"):
+            self.capture.set_frequency(frequency)
+        time.sleep(0.03)
+
+    def measure_channel_power(self, frequency: float, dwell_time: float = 0.08) -> float:
+        """Fast center-channel power only (no TETRA classification)."""
+        try:
+            self._tune(frequency)
+            num_samples = min(int(self.sample_rate * dwell_time), 64 * 1024)
+            num_samples = max(num_samples, 4096)
+            samples = self.capture.read_samples(num_samples)
+            return float(self.detector.calculate_power(samples))
+        except Exception as e:
+            logger.debug("Power measure failed at %.3f MHz: %s", frequency / 1e6, e)
+            return -120.0
+
     def scan_frequency(self, frequency: float, dwell_time: float = 0.5) -> Dict:
         """
         Scan a single frequency for TETRA signals.
@@ -334,14 +363,7 @@ class FrequencyScanner:
             Detection result dictionary
         """
         try:
-            # Tune to frequency
-            if hasattr(self.capture, 'sdr') and self.capture.sdr:
-                self.capture.sdr.center_freq = frequency
-            elif hasattr(self.capture, 'set_frequency'):
-                self.capture.set_frequency(frequency)
-            
-            # Wait for PLL to lock (shorter wait)
-            time.sleep(0.05)
+            self._tune(frequency)
             
             # Capture samples (limit to prevent hanging)
             num_samples = min(int(self.sample_rate * dwell_time), 256 * 1024)  # Max 256k samples
@@ -379,6 +401,66 @@ class FrequencyScanner:
                 'signal_present': False,
                 'error': str(e)
             }
+
+    def find_energy_peaks(
+        self,
+        start_freq: float,
+        stop_freq: float,
+        step: float,
+        *,
+        snr_db: float = 12.0,
+        cancel_check=None,
+        progress_cb=None,
+    ) -> List[Dict]:
+        """
+        Pass 1: survey channel power, estimate noise from the band itself,
+        return local peaks with SNR above ``snr_db``.
+        """
+        freqs: List[float] = []
+        powers: List[float] = []
+        f = float(start_freq)
+        total = max(1, int((stop_freq - start_freq) / step) + 1)
+        idx = 0
+        while f <= stop_freq + 1.0:
+            if cancel_check is not None and cancel_check():
+                break
+            p = self.measure_channel_power(f, dwell_time=0.06)
+            freqs.append(f)
+            powers.append(p)
+            idx += 1
+            if progress_cb is not None:
+                progress_cb(int(50 * idx / total), f"{f/1e6:.3f} MHz (énergie)")
+            f += step
+
+        if len(powers) < 3:
+            return []
+
+        arr = np.asarray(powers, dtype=np.float64)
+        noise = float(np.percentile(arr, 30))
+        threshold = noise + float(snr_db)
+        peaks: List[Dict] = []
+        for i in range(1, len(arr) - 1):
+            if arr[i] < threshold:
+                continue
+            # Local maximum vs neighbours (avoids listing a whole plateau)
+            if arr[i] >= arr[i - 1] and arr[i] >= arr[i + 1]:
+                peaks.append(
+                    {
+                        "frequency": freqs[i],
+                        "frequency_mhz": freqs[i] / 1e6,
+                        "power_db": float(arr[i]),
+                        "snr_db": float(arr[i] - noise),
+                        "noise_db": noise,
+                    }
+                )
+        peaks.sort(key=lambda x: x["power_db"], reverse=True)
+        logger.info(
+            "Energy survey: noise≈%.1f dB, threshold=%.1f dB, %s peak(s)",
+            noise,
+            threshold,
+            len(peaks),
+        )
+        return peaks
     
     def scan_range(self, start_freq: float, end_freq: float, 
                    min_power: float = -70, min_confidence: float = 0.4) -> List[Dict]:

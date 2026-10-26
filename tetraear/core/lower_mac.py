@@ -4,14 +4,137 @@ Pure-Python lower MAC / FEC helpers ported from osmo-tetra.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 SCRAMB_INIT = 3
 TETRA_CRC_OK = 0x1D0F
+
+# ETSI EN 300 392-2 §8.2.3.2 — (30,14) RM parity matrix P (14×16)
+_RM_30_14_PARITY = np.array(
+    [
+        [1, 0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+        [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+        [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+        [1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1, 0],
+        [0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0],
+        [0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1],
+        [1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1],
+        [0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1],
+        [0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+        [0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1],
+        [0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1],
+        [0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1],
+    ],
+    dtype=np.uint8,
+)
+
+# Precomputed systematic generator rows as 30-bit masks (data in MSBs)
+_RM_30_14_ROWS: Optional[np.ndarray] = None
+
+
+def _rm3014_rows() -> np.ndarray:
+    global _RM_30_14_ROWS
+    if _RM_30_14_ROWS is not None:
+        return _RM_30_14_ROWS
+    rows = np.zeros(14, dtype=np.uint32)
+    for i in range(14):
+        val = 1 << (29 - i)  # identity bit in positions 29..16
+        parity = 0
+        for c in range(16):
+            if _RM_30_14_PARITY[i, c]:
+                parity |= 1 << (15 - c)
+        rows[i] = val | parity
+    _RM_30_14_ROWS = rows
+    return rows
+
+
+def rm3014_encode(data14: int) -> int:
+    """Encode 14 data bits into a 30-bit systematic RM codeword."""
+    data14 &= 0x3FFF
+    code = 0
+    rows = _rm3014_rows()
+    for i in range(14):
+        if (data14 >> (13 - i)) & 1:
+            code ^= int(rows[i])
+    return code & 0x3FFFFFFF
+
+
+def rm3014_decode(bits30, *, max_dist: int = 2) -> Optional[np.ndarray]:
+    """
+    Decode 30 AACH bits with nearest-codeword search (Hamming).
+
+    Accepts hard bits (0/1) or soft bits (negative => bit 1).
+    Returns 14 type-1 bits, or None if input is too short / too noisy.
+
+    ``max_dist`` rejects weak matches. Without this, random AACH noise almost
+    always yields some 14-bit word and falsely marks slots as traffic (→ codec
+    noise clicks). RM(30,14) reliably corrects ≤2 errors.
+    """
+    arr = np.asarray(bits30)
+    if arr.size < 30:
+        return None
+    arr = arr[:30]
+    if np.any((arr != 0) & (arr != 1)):
+        hard = np.array(arr < 0, dtype=np.uint8)
+    else:
+        hard = arr.astype(np.uint8, copy=False)
+
+    recv = 0
+    for i, b in enumerate(hard):
+        if b:
+            recv |= 1 << (29 - i)
+
+    # Fast path: systematic prefix already a codeword
+    prefix = (recv >> 16) & 0x3FFF
+    if rm3014_encode(prefix) == recv:
+        out = np.zeros(14, dtype=np.uint8)
+        for i in range(14):
+            out[i] = (prefix >> (13 - i)) & 1
+        return out
+
+    best_data = prefix
+    best_dist = bin(rm3014_encode(prefix) ^ recv).count("1")
+
+    # Try all single and double bit flips of the 14-bit systematic part
+    for i in range(14):
+        cand = prefix ^ (1 << i)
+        dist = bin(rm3014_encode(cand) ^ recv).count("1")
+        if dist < best_dist:
+            best_dist = dist
+            best_data = cand
+            if best_dist == 0:
+                break
+    if best_dist > 0:
+        for i in range(14):
+            for j in range(i + 1, 14):
+                cand = prefix ^ (1 << i) ^ (1 << j)
+                dist = bin(rm3014_encode(cand) ^ recv).count("1")
+                if dist < best_dist:
+                    best_dist = dist
+                    best_data = cand
+                    if best_dist == 0:
+                        break
+            if best_dist == 0:
+                break
+
+    # Never brute-force all 2^14 codewords here: that path ran on every noisy
+    # AACH burst and could freeze/abort the capture thread under load.
+    if best_dist > max_dist:
+        return None
+
+    out = np.zeros(14, dtype=np.uint8)
+    for i in range(14):
+        out[i] = (best_data >> (13 - i)) & 1
+    return out
 
 
 class BlockType(Enum):
@@ -371,41 +494,53 @@ def detect_training_sequence(bits: np.ndarray, start: int = 0) -> tuple[TrainSeq
 
 
 def build_cdecoder_block(type4_bits: np.ndarray) -> Optional[bytes]:
-    """Build ETSI TCH cdecoder input block (690 shorts) from 432 type-4 bits."""
+    """Build ETSI TCH cdecoder input block (690 shorts) from 432 type-4 bits.
+
+    Hard bits (0/1) become ±127. Soft bits (any other values) keep their
+    signed magnitude, clipped to [-127, 127] — better for cdecoder.
+    Layout matches EN 300 395-2 Table 7 (sync words 0x6B21..0x6B26).
+    """
     if type4_bits is None or len(type4_bits) < 432:
         return None
     soft = np.any((type4_bits != 0) & (type4_bits != 1))
+
+    def to_soft(v: int) -> int:
+        if soft:
+            return int(np.clip(int(v), -127, 127)) or (1 if int(v) >= 0 else -1)
+        return -127 if int(v) else 127
+
     block = np.zeros(690, dtype=np.int16)
     for i in range(6):
         block[115 * i] = 0x6B21 + i
     for i in range(114):
-        bit0 = type4_bits[i]
-        bit1 = type4_bits[114 + i]
-        bit2 = type4_bits[228 + i]
-        block[1 + i] = -127 if (bit0 < 0 if soft else bit0) else 127
-        block[116 + i] = -127 if (bit1 < 0 if soft else bit1) else 127
-        block[231 + i] = -127 if (bit2 < 0 if soft else bit2) else 127
+        block[1 + i] = to_soft(type4_bits[i])
+        block[116 + i] = to_soft(type4_bits[114 + i])
+        block[231 + i] = to_soft(type4_bits[228 + i])
     for i in range(90):
-        bit3 = type4_bits[342 + i]
-        block[346 + i] = -127 if (bit3 < 0 if soft else bit3) else 127
+        block[346 + i] = to_soft(type4_bits[342 + i])
     return block.tobytes()
 
 
 def decode_access_assign(bits: np.ndarray) -> Optional[int]:
-    """Decode AACH Access-Assign to get DL usage marker."""
+    """Decode AACH Access-Assign to get a DL usage marker for the current slot.
+
+    ETSI EN 300 392-2 Access Assign (14 type-1 bits):
+    - hdr ``01`` (1): field1 = DL usage of current slot
+    - hdr ``10``/``11`` (2/3): dual-slot forms — field1/field2 are DL usages;
+      return the max so a traffic value in either half is visible
+    - hdr ``00``: unused / common — ignored
+    """
     if bits is None or len(bits) < 14:
         return None
     if np.any((bits != 0) & (bits != 1)):
         bits = np.array(bits < 0, dtype=np.uint8)
     hdr = bits_to_uint(bits, 0, 2)
     field1 = bits_to_uint(bits, 2, 6)
-    field2 = bits_to_uint(bits, 8, 6)
-    if hdr == 0:
-        return None
+    field2 = bits_to_uint(bits, 8, 6) if len(bits) >= 14 else 0
     if hdr == 1:
         return field1
     if hdr in (2, 3):
-        return field1
+        return field1 if field1 >= field2 else field2
     return None
 
 
@@ -415,6 +550,10 @@ class LowerMacDecoder:
         self.mnc: Optional[int] = None
         self.colour_code: Optional[int] = None
         self.scramb_init: Optional[int] = None
+        # Sticky traffic lock: same AACH usage marker must repeat before we
+        # trust the slot as TCH (filters one-off RM false positives).
+        self._traffic_marker: Optional[int] = None
+        self._traffic_streak: int = 0
 
     def _decode_block(self, block_type: BlockType, bits: np.ndarray, *, force_scramb: Optional[int] = None) -> LowerMacBlock:
         params = BLOCK_PARAMS[block_type]
@@ -442,6 +581,14 @@ class LowerMacDecoder:
             else:
                 type3dp = tetra_rcpc_depunct("2_3", type3.astype(np.uint8), params.type2_bits * 4)
             type2 = viterbi_decode_cch(type3dp, params.type2_bits)
+        elif block_type == BlockType.BBK:
+            # AACH: RM(30,14) systematic block code (no convolution/interleave)
+            type1_rm = rm3014_decode(type4)
+            type2 = type4[: params.type2_bits]
+            if type1_rm is None:
+                # Do NOT fall back to raw type-4 — that invents fake Access-Assign PDUs
+                return LowerMacBlock(block_type, 0, None, False, type4, scramb_init)
+            return LowerMacBlock(block_type, 0, type1_rm, True, type4, scramb_init)
         else:
             type2 = type4[: params.type2_bits]
 
@@ -477,7 +624,15 @@ class LowerMacDecoder:
                     "colour_code": colour,
                     "mcc": mcc,
                     "mnc": mnc,
+                    "scramb_init": self.scramb_init,
                 }
+                logger.info(
+                    "Cell SYNC lock: MCC=%s MNC=%s CC=%s scramb_init=0x%08x",
+                    mcc,
+                    mnc,
+                    colour,
+                    self.scramb_init,
+                )
 
             bbk_bits = bits[SB_BBK_OFFSET : SB_BBK_OFFSET + SB_BBK_BITS]
             bbk = self._decode_block(BlockType.BBK, bbk_bits)
@@ -495,36 +650,103 @@ class LowerMacDecoder:
                 ]
             )
             bbk = self._decode_block(BlockType.BBK, bbk_bits)
-            dl_usage = decode_access_assign(bbk.type1_bits if bbk.type1_bits is not None else bbk.type4_bits)
-            is_traffic = bool(dl_usage is not None and dl_usage > 3)
+            # Only trust RM-decoded 14 type-1 bits — never raw type-4 (wrong length/layout).
+            # rm3014_decode now returns None when Hamming distance is too high.
+            dl_usage = (
+                decode_access_assign(bbk.type1_bits)
+                if bbk.type1_bits is not None and len(bbk.type1_bits) >= 14
+                else None
+            )
+            # DL usage ≥ 4 ⇒ traffic (call identifier). 0–3 = idle/control/reserved.
+            traffic_candidate = bool(dl_usage is not None and dl_usage >= 4)
+            if traffic_candidate:
+                if dl_usage == self._traffic_marker:
+                    self._traffic_streak += 1
+                else:
+                    self._traffic_marker = dl_usage
+                    self._traffic_streak = 1
+            else:
+                self._traffic_streak = 0
+                if dl_usage is not None:
+                    self._traffic_marker = None
+
+            # Decode TCH as soon as AACH says traffic (RM already gated).
+            # "Locked" (streak>=2) only raises voice_verified confidence.
+            is_traffic = bool(traffic_candidate)
+            traffic_locked = bool(traffic_candidate and self._traffic_streak >= 2)
             bbk.is_traffic = is_traffic
-            bbk.extra = {"dl_usage": dl_usage} if dl_usage is not None else None
+            bbk.extra = {
+                "dl_usage": dl_usage,
+                "traffic_streak": self._traffic_streak,
+                "traffic_locked": traffic_locked,
+            }
+            if dl_usage is not None:
+                logger.debug(
+                    "AACH dl_usage=%s traffic=%s locked=%s streak=%s ts=%s",
+                    dl_usage,
+                    is_traffic,
+                    traffic_locked,
+                    self._traffic_streak,
+                    train_seq.value,
+                )
             blocks.append(bbk)
 
+            blk1_bits = bits[NDB_BLK1_OFFSET : NDB_BLK1_OFFSET + NDB_BLK_BITS]
+            blk2_bits = bits[NDB_BLK2_OFFSET : NDB_BLK2_OFFSET + NDB_BLK_BITS]
+            # Full-slot TCH/S uses both half-slots (432 type-5 bits) regardless of
+            # training sequence. Previously NORM_2 returned early with no codec_input
+            # → almost no voice, only rare choppy noise clicks.
+            combined = np.concatenate([blk1_bits, blk2_bits])
+
             if train_seq == TrainSeq.NORM_2:
-                blk1_bits = bits[NDB_BLK1_OFFSET : NDB_BLK1_OFFSET + NDB_BLK_BITS]
-                blk2_bits = bits[NDB_BLK2_OFFSET : NDB_BLK2_OFFSET + NDB_BLK_BITS]
                 blk1 = self._decode_block(BlockType.NDB, blk1_bits)
                 blk1.blk_num = 1
                 blk1.is_traffic = is_traffic
                 blk2 = self._decode_block(BlockType.NDB, blk2_bits)
                 blk2.blk_num = 2
                 blk2.is_traffic = is_traffic
+                self._attach_tch_codec(
+                    blk1, combined, dl_usage=dl_usage, verified=traffic_locked
+                )
                 blocks.extend([blk1, blk2])
                 return blocks
 
-            # Train seq NORM_1 -> SCH/F combined blocks
-            combined = np.concatenate(
-                [
-                    bits[NDB_BLK1_OFFSET : NDB_BLK1_OFFSET + NDB_BLK_BITS],
-                    bits[NDB_BLK2_OFFSET : NDB_BLK2_OFFSET + NDB_BLK_BITS],
-                ]
-            )
+            # NORM_1 -> SCH/F (or TCH/S) full slot
             schf = self._decode_block(BlockType.SCH_F, combined)
             schf.is_traffic = is_traffic
-            if is_traffic:
-                schf.codec_input = build_cdecoder_block(schf.type4_bits)
+            self._attach_tch_codec(
+                schf, combined, dl_usage=dl_usage, verified=traffic_locked
+            )
             blocks.append(schf)
             return blocks
 
         return blocks
+
+    def _attach_tch_codec(
+        self,
+        block: LowerMacBlock,
+        combined_type5: np.ndarray,
+        *,
+        dl_usage: Optional[int],
+        verified: bool,
+    ) -> None:
+        """Build cdecoder input from a full-slot type-5 payload when traffic."""
+        if not block.is_traffic or self.scramb_init is None:
+            return
+        type5 = combined_type5[: BLOCK_PARAMS[BlockType.SCH_F].type345_bits]
+        if len(type5) < BLOCK_PARAMS[BlockType.SCH_F].type345_bits:
+            return
+        if np.any((type5 != 0) & (type5 != 1)):
+            type4_for_codec = tetra_scramb_soft(
+                self.scramb_init, type5.astype(np.int16)
+            )
+        else:
+            type4_for_codec = tetra_scramb_bits(
+                self.scramb_init, type5.astype(np.uint8)
+            )
+        block.codec_input = build_cdecoder_block(type4_for_codec)
+        if block.extra is None:
+            block.extra = {}
+        block.extra["dl_usage"] = dl_usage
+        block.extra["voice_verified"] = bool(verified)
+        block.extra["traffic_streak"] = self._traffic_streak

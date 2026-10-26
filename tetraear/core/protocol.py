@@ -653,6 +653,29 @@ class TetraProtocolParser:
             data_bits = bits[4:]
             data_bytes = _bits_to_bytes(data_bits)
             length = len(data_bytes)
+            # SYSINFO (broadcast_type=0): extract Location Area from D-MLE-SYSINFO
+            # Layout after MAC header (common osmo-tetra / telive compatible):
+            # main_carrier(12) freq_band(4) offset(2) duplex(3) reverse(1)
+            # unused(2) n_frames(3) frame18_ext(1) -> LA(14)
+            if broadcast_type == 0 and len(bits) >= 4 + 12 + 4 + 2 + 3 + 1 + 2 + 3 + 1 + 14:
+                cur = 4
+                extra["main_carrier"] = _bits_to_uint(bits, cur, 12); cur += 12
+                extra["frequency_band"] = _bits_to_uint(bits, cur, 4); cur += 4
+                extra["offset"] = _bits_to_uint(bits, cur, 2); cur += 2
+                extra["duplex_spacing"] = _bits_to_uint(bits, cur, 3); cur += 3
+                extra["reverse_operation"] = _bits_to_uint(bits, cur, 1); cur += 1
+                cur += 2  # unused
+                extra["n_frames_continuous"] = _bits_to_uint(bits, cur, 3); cur += 3
+                extra["frame18_extension"] = _bits_to_uint(bits, cur, 1); cur += 1
+                location_area = _bits_to_uint(bits, cur, 14)
+                extra["location_area"] = location_area
+                self.la = location_area
+                logger.info(
+                    "SYSINFO: LA=%s carrier=%s band=%s",
+                    location_area,
+                    extra.get("main_carrier"),
+                    extra.get("frequency_band"),
+                )
 
         elif pdu_type == PDUType.MAC_FRAG:
             frag_end_flag = _bits_to_uint(bits, 2, 1)
@@ -1394,47 +1417,50 @@ class TetraProtocolParser:
 
     def _parse_broadcast(self, mac_pdu: MacPDU) -> Optional[CallMetadata]:
         """
-        Parse MAC-BROADCAST (SYSINFO/SYNC).
-        Extracts MCC, MNC, LA, Color Code.
-        """
-        data = mac_pdu.data
-        if len(data) < 5:
-            return None
-            
-        # D-MLE-SYNC structure (approximate):
-        # MCC (10 bits)
-        # MNC (14 bits)
-        # Neighbour Cell Info...
-        
-        try:
-            # Convert to bits for easier parsing
-            bits = BitArray(data)
-            
-            # MCC: 10 bits
-            mcc = bits[0:10].uint
-            
-            # MNC: 14 bits
-            mnc = bits[10:24].uint
-            
-            # Colour Code: 6 bits (often follows)
-            colour_code = bits[24:30].uint
-            
-            # VALIDATE: Real TETRA networks use MCC 200-799 (ITU-T E.212)
-            # Values outside this range indicate noise/invalid data
-            if mcc < 200 or mcc > 799:
-                logger.debug(f"Invalid MCC {mcc} - likely noise, not real TETRA")
-                return None
-            
-            # VALIDATE: MNC should be reasonable (0-999 typically)
-            if mnc > 999:
-                logger.debug(f"Invalid MNC {mnc} - likely noise, not real TETRA")
-                return None
-            
-            self._record_network_candidate(mcc, mnc, colour_code, strong=mac_pdu.crc_ok is True)
+        Parse MAC-BROADCAST metadata.
 
-            logger.info(f"Decoded TETRA network: MCC={mcc} MNC={mnc} CC={colour_code}")
-            
-            # Return metadata with just network info
+        MCC/MNC/CC are authoritative from SYNC SB1 (lower MAC). SYSINFO
+        contributes Location Area via mac_pdu.extra['location_area'].
+        """
+        try:
+            mcc = self.mcc
+            mnc = self.mnc
+            colour_code = self.colour_code or 0
+            la = None
+            if mac_pdu.extra:
+                la = mac_pdu.extra.get("location_area")
+                if la is not None:
+                    self.la = la
+
+            # Prefer already-locked cell identity from SB1
+            if mcc is None or mnc is None:
+                data = mac_pdu.data
+                if data is None or len(data) < 4:
+                    return None
+                # Legacy fallback only if SB1 has not locked yet
+                bits = BitArray(data)
+                if len(bits) >= 30:
+                    cand_mcc = bits[0:10].uint
+                    cand_mnc = bits[10:24].uint
+                    cand_cc = bits[24:30].uint
+                    if 200 <= cand_mcc <= 799 and cand_mnc <= 999:
+                        mcc, mnc, colour_code = cand_mcc, cand_mnc, cand_cc
+                        self._record_network_candidate(
+                            mcc, mnc, colour_code, strong=mac_pdu.crc_ok is True
+                        )
+
+            if mcc is None or mnc is None:
+                return None
+
+            if mac_pdu.crc_ok is True or (mcc is not None and mnc is not None):
+                logger.info(
+                    "Decoded TETRA network: MCC=%s MNC=%s CC=%s LA=%s",
+                    mcc,
+                    mnc,
+                    colour_code,
+                    la if la is not None else self.la,
+                )
+
             return CallMetadata(
                 call_type="Broadcast",
                 talkgroup_id=None,
@@ -1443,9 +1469,9 @@ class TetraProtocolParser:
                 channel_allocated=None,
                 mcc=mcc,
                 mnc=mnc,
-                encryption_enabled=False
+                encryption_enabled=False,
             )
-        except:
+        except Exception:
             return None
     
     def parse_sds_message(self, mac_pdu: MacPDU) -> Optional[str]:

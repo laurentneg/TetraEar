@@ -76,10 +76,23 @@ pip install -r requirements.txt
 ```
 
 ### 3️⃣ (Optional) Install TETRA Codec
-Place `cdecoder.exe` and `sdecoder.exe` in `tetraear/tetra_codec/bin/` directory, or run:
+Builds ETSI `cdecoder`/`sdecoder` **and** native shared libs (`tetra_cdec` + mbelib-neo).
+
+**Linux:**
 ```bash
-python -m tetraear.tools.install_tetra_codec
+./scripts/install_tetra_codec.sh
+# or: python -m tetraear.tools.install_tetra_codec
 ```
+
+**Windows** (MSYS2 MinGW64 — `gcc`, `cmake`, `mingw32-make`, `patch`, `git`):
+```bat
+scripts\install_tetra_codec.bat
+```
+```powershell
+.\scripts\install_tetra_codec.ps1
+# or: python -m tetraear.tools.install_tetra_codec
+```
+Place prebuilt `cdecoder.exe` / `sdecoder.exe` in `tetraear/tetra_codec/bin/` if you only need the subprocess fallback.
 
 ### 4️⃣ Verify Installation
 ```bash

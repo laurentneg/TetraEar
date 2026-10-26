@@ -108,18 +108,28 @@ def _get_log_dir() -> Path:
     return RUNTIME_ROOT / "logs"
 
 
-def _setup_logging(verbose: bool) -> dict[str, Path]:
+# Per-frame JSONL dumps are expensive (tens of MB/session). Off unless --debug.
+_DEBUG_FRAME_LOG = False
+
+
+def _setup_logging(debug: bool) -> dict[str, Path]:
     """
     Configure structured logging for the application.
 
-    Creates multiple log files under the logs directory:
+    Default (no --debug): INFO only, no per-frame JSONL file.
+    With --debug / -v: DEBUG files + `frames_<run>.log` (one JSON line per frame).
+
+    Creates log files under the logs directory:
       - `tetraear_<run>.log`   (everything)
       - `app_<run>.log`       (UI + capture/signal pipeline)
       - `decoder_<run>.log`   (decoder/protocol)
       - `codec_<run>.log`     (codec calls + stdout/stderr)
       - `audio_<run>.log`     (recording + audio pipeline)
-      - `frames_<run>.log`    (frames table rows as JSONL)
+      - `frames_<run>.log`    (frames as JSONL — only if debug)
     """
+    global _DEBUG_FRAME_LOG
+    _DEBUG_FRAME_LOG = bool(debug)
+
     log_dir = _get_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +143,7 @@ def _setup_logging(verbose: bool) -> dict[str, Path]:
     }
 
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    file_level = logging.DEBUG if debug else logging.INFO
 
     def make_file_handler(path: Path, *, level: int = logging.DEBUG, filt: logging.Filter | None = None) -> logging.Handler:
         handler = logging.FileHandler(str(path), encoding="utf-8", delay=True)
@@ -142,27 +153,35 @@ def _setup_logging(verbose: bool) -> dict[str, Path]:
             handler.addFilter(filt)
         return handler
 
-    all_handler = make_file_handler(files["all"])
-    app_handler = make_file_handler(files["app"], filt=_PrefixFilter("tetraear.ui.modern", "tetraear.signal"))
-    decoder_handler = make_file_handler(files["decoder"], filt=_PrefixFilter("tetraear.core.decoder", "tetraear.core.protocol"))
-    codec_handler = make_file_handler(files["codec"], filt=_PrefixFilter("tetraear.codec"))
-    audio_handler = make_file_handler(files["audio"], filt=_PrefixFilter("tetraear.recording", "tetraear.audio"))
-    frames_handler = make_file_handler(files["frames"], level=logging.INFO, filt=_PrefixFilter("tetraear.frames"))
+    all_handler = make_file_handler(files["all"], level=file_level)
+    app_handler = make_file_handler(files["app"], level=file_level, filt=_PrefixFilter("tetraear.ui.modern", "tetraear.signal"))
+    decoder_handler = make_file_handler(files["decoder"], level=file_level, filt=_PrefixFilter("tetraear.core.decoder", "tetraear.core.protocol"))
+    codec_handler = make_file_handler(files["codec"], level=file_level, filt=_PrefixFilter("tetraear.codec"))
+    audio_handler = make_file_handler(files["audio"], level=file_level, filt=_PrefixFilter("tetraear.recording", "tetraear.audio"))
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
     console_handler.setFormatter(ColoredFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    root.setLevel(logging.DEBUG if debug else logging.INFO)
     root.handlers.clear()
     root.addHandler(all_handler)
     root.addHandler(app_handler)
     root.addHandler(decoder_handler)
     root.addHandler(codec_handler)
     root.addHandler(audio_handler)
-    root.addHandler(frames_handler)
     root.addHandler(console_handler)
+
+    frames_logger_obj = logging.getLogger("tetraear.frames")
+    if debug:
+        frames_handler = make_file_handler(files["frames"], level=logging.INFO, filt=_PrefixFilter("tetraear.frames"))
+        root.addHandler(frames_handler)
+        frames_logger_obj.setLevel(logging.INFO)
+    else:
+        # Keep logger quiet; avoid creating a huge frames_*.log by default
+        frames_logger_obj.setLevel(logging.WARNING)
+        frames_logger_obj.propagate = False
 
     # Route `warnings.warn(...)` through logging too.
     logging.captureWarnings(True)
@@ -184,6 +203,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, pyqtSlot, QSize, QRect, QObject
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QLinearGradient, QPen, QBrush, QPixmap, QImage, QPainterPath, QIcon
 
+import queue
+import threading
 import numpy as np
 import sounddevice as sd
 from scipy.signal import resample
@@ -330,7 +351,7 @@ class SettingsManager:
         "save_silence": False,
         "export_mp3": False,
         "auto_decrypt": True,
-        "monitor_audio": False,
+        "monitor_audio": True,
         "monitor_raw": False,
         "gain": 50.0,
         "sample_rate": 2.4e6,
@@ -370,8 +391,10 @@ class SettingsManager:
     def get(self, key, default=None):
         return self.settings.get(key, default)
         
-    def set(self, key, value):
+    def set(self, key, value, *, persist: bool = False):
         self.settings[key] = value
+        if persist:
+            self.save()
 
 class FrequencyManager:
     """Manage saved frequencies."""
@@ -712,11 +735,13 @@ class WaterfallWidget(QWidget):
         self.smoothed_fft = None
         self.avg_factor = 0.15
         
-        # Update throttling - limit to ~60 FPS for live feel
+        # Update throttling — 30 FPS is enough; higher rates starve audio/UI
         self.update_timer = QTimer(self)
-        self.update_timer.setInterval(16)  # ~60 FPS
+        self.update_timer.setInterval(33)  # ~30 FPS
         self.update_timer.timeout.connect(self._do_update)
         self.pending_update = False
+        self._last_waterfall_line_t = 0.0
+        self._waterfall_line_interval = 0.05  # max ~20 waterfall lines/s
         
         # Cached elements for performance
         self.waterfall_buffer = None  # Persistent buffer for scrolling
@@ -731,13 +756,28 @@ class WaterfallWidget(QWidget):
         self.setMouseTracking(True)
 
     def mouseMoveEvent(self, event):
-        """Handle mouse move for bandwidth overlay."""
-        x = event.pos().x()
+        """Handle mouse move for bandwidth overlay (spectrum section only)."""
         width = self.width()
-        if width > 0:
-            freq_range = self.freq_max - self.freq_min
-            self.mouse_freq = self.freq_min + (x / width) * freq_range
+        height = self.height()
+        if width <= 0 or height <= 0:
+            return
+        # Selection bars only while hovering the spectrum analyzer (top ~70%)
+        spectrum_height = int(height * 0.7)
+        if event.pos().y() > spectrum_height:
+            if self.mouse_freq is not None:
+                self.mouse_freq = None
+                self.update()
+            return
+        freq_range = self.freq_max - self.freq_min
+        self.mouse_freq = self.freq_min + (event.pos().x() / width) * freq_range
+        self.update()
+
+    def leaveEvent(self, event):
+        """Hide mouse selection bars when the cursor leaves the spectrum widget."""
+        if self.mouse_freq is not None:
+            self.mouse_freq = None
             self.update()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         """Handle mouse click to tune."""
@@ -900,6 +940,8 @@ class WaterfallWidget(QWidget):
         """Set zoom level (1.0 to 10.0)."""
         self.zoom_level = max(1.0, min(10.0, level))
         self.update_view_range()
+        # History was drawn at the previous span — clear so new lines match zoom
+        self.waterfall_buffer = None
         self.update()
 
     def set_denoiser(self, enabled):
@@ -909,9 +951,19 @@ class WaterfallWidget(QWidget):
             self.smoothed_fft = None
 
     def update_view_range(self):
-        """Update visible frequency range based on zoom."""
+        """Update visible frequency range based on zoom.
+
+        The listening channel (tuned_freq) is kept in view whenever possible so
+        the red channel bars do not vanish after Tune / zoom / LO settle.
+        """
         if self.full_freq_min is not None and self.full_freq_max is not None:
-            center = self.view_center if self.view_center is not None else (self.full_freq_min + self.full_freq_max) / 2
+            # Prefer the committed listening frequency as viewport center
+            if self.view_center is not None:
+                center = self.view_center
+            elif self.tuned_freq is not None:
+                center = self.tuned_freq
+            else:
+                center = (self.full_freq_min + self.full_freq_max) / 2
             span = self.full_freq_max - self.full_freq_min
             
             # Apply zoom
@@ -932,6 +984,26 @@ class WaterfallWidget(QWidget):
 
             self.freq_min = max(self.full_freq_min, target_min)
             self.freq_max = min(self.full_freq_max, target_max)
+
+            # If clamping pushed the listening channel out of view (common right
+            # after Tune while FFT still covers the previous LO), shift back.
+            if self.tuned_freq is not None and self.freq_max > self.freq_min:
+                if self.tuned_freq < self.freq_min or self.tuned_freq > self.freq_max:
+                    half = (self.freq_max - self.freq_min) / 2.0
+                    self.freq_min = self.tuned_freq - half
+                    self.freq_max = self.tuned_freq + half
+                    # Stay inside full span if the tuned freq is already covered
+                    if self.full_freq_min <= self.tuned_freq <= self.full_freq_max:
+                        if self.freq_min < self.full_freq_min:
+                            d = self.full_freq_min - self.freq_min
+                            self.freq_min += d
+                            self.freq_max += d
+                        if self.freq_max > self.full_freq_max:
+                            d = self.freq_max - self.full_freq_max
+                            self.freq_min -= d
+                            self.freq_max -= d
+                        self.freq_min = max(self.full_freq_min, self.freq_min)
+                        self.freq_max = min(self.full_freq_max, self.freq_max)
             
             # Invalidate grid cache
             self.grid_cache = None
@@ -943,7 +1015,13 @@ class WaterfallWidget(QWidget):
         self.update()
     
     def set_tuned_frequency(self, freq_mhz):
-        """Set tuned frequency for display."""
+        """Set committed listening frequency for the red channel bars."""
+        try:
+            freq_mhz = float(freq_mhz)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(freq_mhz):
+            return
         self.tuned_freq = freq_mhz
         self.view_center = freq_mhz
         self.update_view_range()
@@ -978,7 +1056,7 @@ class WaterfallWidget(QWidget):
                 self.peak_freq = self.current_freqs[peak_idx]
                 self.peak_power = powers[peak_idx]
             
-            # Add to waterfall history (for resizing)
+            # Add to waterfall history (for resizing) — cap memory
             self.waterfall_data.append(self.current_fft.copy())
             
             # Update full frequency range
@@ -987,10 +1065,14 @@ class WaterfallWidget(QWidget):
                 self.full_freq_max = np.max(self.current_freqs)
                 self.update_view_range()
             
-            # Update waterfall buffer immediately (scrolling)
-            self._update_waterfall_buffer()
+            # Scroll waterfall at most ~20 lines/s (QPainter on every IQ chunk was janky)
+            import time as _time
+            now = _time.monotonic()
+            if now - self._last_waterfall_line_t >= self._waterfall_line_interval:
+                self._update_waterfall_buffer()
+                self._last_waterfall_line_t = now
             
-            # Throttle UI updates
+            # Throttle UI paint via timer
             self.pending_update = True
             if not self.update_timer.isActive():
                 self.update_timer.start()
@@ -1021,12 +1103,22 @@ class WaterfallWidget(QWidget):
         temp_painter = QPainter(self.waterfall_buffer)
         temp_painter.drawImage(0, 1, self.waterfall_buffer, 0, 0, width, waterfall_height - 1)
         
-        # Draw new line at top (y=0)
+        # Draw new line at top (y=0), cropped to the same zoomed freq window as the spectrum
         fft_len = len(self.current_fft)
         if fft_len > 0:
-            # Create a single line image
-            line_indices = np.linspace(0, fft_len - 1, width, dtype=np.int32)
-            resampled = self.current_fft[line_indices]
+            freqs = self.current_freqs
+            if (
+                freqs is not None
+                and len(freqs) == fft_len
+                and self.freq_max > self.freq_min
+            ):
+                # Sample FFT power across the visible [freq_min, freq_max] span
+                visible_freqs = np.linspace(self.freq_min, self.freq_max, width)
+                resampled = np.interp(visible_freqs, freqs, self.current_fft)
+            else:
+                # Fallback: full FFT stretched to width (pre-zoom / no freqs yet)
+                line_indices = np.linspace(0, fft_len - 1, width, dtype=np.int32)
+                resampled = self.current_fft[line_indices]
             
             # Normalize
             power_range = self.power_max - self.power_min
@@ -1064,13 +1156,16 @@ class WaterfallWidget(QWidget):
                 rgb_line[mask4, 0] = 255
                 rgb_line[mask4, 1] = np.clip(((1 - t) * 255).astype(np.uint8), 0, 255)
             
-            # Convert to QImage line
-            pixels = (0xFF000000 | 
-                     (rgb_line[:, 0].astype(np.uint32) << 16) | 
-                     (rgb_line[:, 1].astype(np.uint32) << 8) | 
-                     rgb_line[:, 2].astype(np.uint32))
-            
-            line_img = QImage(pixels.tobytes(), width, 1, QImage.Format.Format_RGB32)
+            # Convert to QImage line — .copy() owns the buffer (avoids UAF/SIGABRT
+            # when QImage only wraps a temporary bytes object).
+            pixels = (
+                0xFF000000
+                | (rgb_line[:, 0].astype(np.uint32) << 16)
+                | (rgb_line[:, 1].astype(np.uint32) << 8)
+                | rgb_line[:, 2].astype(np.uint32)
+            )
+            buf = np.ascontiguousarray(pixels).tobytes()
+            line_img = QImage(buf, width, 1, QImage.Format.Format_RGB32).copy()
             temp_painter.drawImage(0, 0, line_img)
             
         temp_painter.end()
@@ -1213,51 +1308,51 @@ class WaterfallWidget(QWidget):
             
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         
-        # Draw tuned frequency marker and bandwidth lines (Red)
+        # Listening channel (committed tune) — solid red bars, always drawn when
+        # the channel intersects the visible window (clamp partial off-screen).
         if self.tuned_freq is not None and freq_range > 0:
             center_freq = self.tuned_freq
-            bw_half = (self.bandwidth / 1e6) / 2  # Convert Hz to MHz
+            bw_half = max((float(self.bandwidth) / 1e6) / 2.0, 1e-6)
 
-            # Calculate x coordinates
-            x_center = x + int(((center_freq - self.freq_min) / freq_range) * width)
-            x_left = x + int(((center_freq - bw_half - self.freq_min) / freq_range) * width)
-            x_right = x + int(((center_freq + bw_half - self.freq_min) / freq_range) * width)
+            def _freq_to_x(freq: float) -> int:
+                return x + int(((freq - self.freq_min) / freq_range) * width)
 
-            # Draw lines if within view
-            pen = QPen(QColor(255, 0, 0), 2)
-            painter.setPen(pen)
+            x_center = _freq_to_x(center_freq)
+            x_left = _freq_to_x(center_freq - bw_half)
+            x_right = _freq_to_x(center_freq + bw_half)
 
-            if 0 <= x_left <= width:
-                painter.drawLine(x_left, y, x_left, y + height)
-            if 0 <= x_right <= width:
-                painter.drawLine(x_right, y, x_right, y + height)
+            band_visible = x_right >= x and x_left <= x + width
+            if band_visible:
+                pen = QPen(QColor(255, 40, 40), 2)
+                painter.setPen(pen)
+                # Clamp so a channel near the edge still shows both sides when possible
+                left_draw = max(x, min(x + width, x_left))
+                right_draw = max(x, min(x + width, x_right))
+                painter.drawLine(left_draw, y, left_draw, y + height)
+                painter.drawLine(right_draw, y, right_draw, y + height)
 
-            # Center line (dashed)
-            pen.setStyle(Qt.PenStyle.DashLine)
-            pen.setWidth(1)
-            painter.setPen(pen)
-            if 0 <= x_center <= width:
-                painter.drawLine(x_center, y, x_center, y + height)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                pen.setWidth(1)
+                painter.setPen(pen)
+                if x <= x_center <= x + width:
+                    painter.drawLine(x_center, y, x_center, y + height)
             
-        # Draw bandwidth overlay if mouse is active
+        # Mouse selection overlay (distinct color; hidden on leave via mouse_freq=None)
         if self.mouse_freq is not None and freq_range > 0:
-            # Calculate width of bandwidth in pixels
-            bw_mhz = self.bandwidth / 1e6
-            bw_pixels = int((bw_mhz / freq_range) * width)
+            bw_mhz = max(float(self.bandwidth) / 1e6, 1e-6)
+            bw_pixels = max(1, int((bw_mhz / freq_range) * width))
             
             mouse_x = x + int(((self.mouse_freq - self.freq_min) / freq_range) * width)
             
-            # Draw two red lines centered on mouse
             left_x = mouse_x - (bw_pixels // 2)
             right_x = mouse_x + (bw_pixels // 2)
             
-            # Solid red lines, brighter
-            painter.setPen(QPen(QColor(255, 0, 0), 2))
+            # Amber — not the listening-channel red, to avoid confusion
+            painter.setPen(QPen(QColor(255, 180, 40), 2))
             painter.drawLine(left_x, y, left_x, y + height)
             painter.drawLine(right_x, y, right_x, y + height)
             
-            # Fill area between lines lightly
-            painter.fillRect(left_x, y, bw_pixels, height, QColor(255, 0, 0, 40))
+            painter.fillRect(left_x, y, bw_pixels, height, QColor(255, 180, 40, 35))
         
         # Draw frequency labels at bottom
         painter.setPen(QPen(QColor(200, 200, 200), 1))
@@ -1673,35 +1768,76 @@ class ScannerDialog(QDialog):
             stop = float(self.stop_freq.text()) * 1e6
             step = float(self.step_freq.text()) * 1e3
             
-            # Import RTLCapture
             from tetraear.signal.capture import RTLCapture
-            
-            # Create RTL capture instance (use SDR device from parent settings if available)
-            sdr_device = None
+            import time as _time
+
             parent = self.parent()
-            if parent is not None and hasattr(parent, "settings_manager"):
-                sdr_device = parent.settings_manager.get("sdr_device", None)
+            # RTL-SDR is exclusive: an active capture owns the dongle and scan
+            # cannot open it ("device not available"). Release it first.
+            if (
+                parent is not None
+                and getattr(parent, "capture_thread", None) is not None
+                and parent.capture_thread.isRunning()
+            ):
+                reply = QMessageBox.question(
+                    self,
+                    "SDR occupé",
+                    "La capture utilise déjà la clé SDR.\n"
+                    "Il faut l’arrêter pour scanner.\n\n"
+                    "Arrêter la capture et lancer le scan ?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                self.progress_label.setText("Arrêt de la capture (libération SDR)…")
+                QApplication.processEvents()
+                try:
+                    parent.on_stop()
+                except Exception as stop_err:
+                    QMessageBox.warning(
+                        self,
+                        "Erreur",
+                        f"Impossible de libérer le SDR : {stop_err}",
+                    )
+                    return
+                _time.sleep(0.4)  # USB reopen settle
+
+            sdr_device = None
+            if parent is not None:
+                if hasattr(parent, "settings_manager"):
+                    sdr_device = parent.settings_manager.get("sdr_device", None)
+                # Prefer live selection if capture thread was configured
+                ct = getattr(parent, "capture_thread", None)
+                if ct is not None and getattr(ct, "sdr_device", None) is not None:
+                    sdr_device = ct.sdr_device
+
             rtl = RTLCapture(frequency=start, sample_rate=2.4e6, gain=50, device=sdr_device)
             if not rtl.open():
-                QMessageBox.warning(self, "Error", "Failed to open RTL-SDR device")
+                QMessageBox.warning(
+                    self,
+                    "SDR indisponible",
+                    "Impossible d’ouvrir la clé RTL-SDR.\n\n"
+                    "Vérifiez qu’aucune autre appli (SDR#, GQRX, une autre\n"
+                    "instance TetraEar) ne l’utilise, puis réessayez.",
+                )
                 return
             
-            # Initialize scanner with noise floor and bottom threshold parameters
             self.scanner = FrequencyScanner(
                 rtl, 
                 sample_rate=2.4e6,
                 scan_step=step,
-                noise_floor=-45,  # Default noise floor
-                bottom_threshold=-85  # Default bottom threshold
+                noise_floor=-45,
+                bottom_threshold=-85,
             )
             self.scan_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
             self.results_table.setRowCount(0)
             self.scanning = True
             
-            # Start scan in thread
-            self.scan_thread = threading.Thread(target=self.run_scan, args=(start, stop, step))
-            self.scan_thread.daemon = True
+            self.scan_thread = threading.Thread(
+                target=self.run_scan, args=(start, stop, step), daemon=True
+            )
             self.scan_thread.start()
             
         except Exception as e:
@@ -1711,59 +1847,88 @@ class ScannerDialog(QDialog):
             self.scanning = False
     
     def run_scan(self, start_freq, stop_freq, step):
-        """Run the scan with live updates."""
+        """Two-pass scan: energy peaks vs band noise, then TETRA check on peaks only."""
         try:
-            num_steps = int((stop_freq - start_freq) / step) + 1
             found_count = 0
-            
-            for step_idx in range(num_steps + 1):
+
+            def _cancel():
+                return not self.scanning
+
+            def _progress(pct, label):
+                self.scan_progress.emit(int(pct), label)
+
+            # Pass 1 — channel power vs noise estimated on this band
+            self.scan_progress.emit(0, "Pass 1/2 — mesure d'énergie…")
+            peaks = self.scanner.find_energy_peaks(
+                start_freq,
+                stop_freq,
+                step,
+                snr_db=12.0,
+                cancel_check=_cancel,
+                progress_cb=_progress,
+            )
+
+            if not self.scanning:
+                self.scan_progress.emit(0, "Scan arrêté")
+                return
+
+            if not peaks:
+                self.scan_progress.emit(100, "Aucun pic au-dessus du bruit (+12 dB)")
+                return
+
+            # Cap verification work (keep strongest peaks)
+            peaks = peaks[:40]
+            self.scan_progress.emit(
+                50, f"Pass 2/2 — vérif TETRA sur {len(peaks)} pic(s)…"
+            )
+
+            for i, peak in enumerate(peaks):
                 if not self.scanning:
                     break
-                    
-                freq = start_freq + step_idx * step
-                if freq > stop_freq:
-                    break
-                
-                # Update progress
-                progress = int((step_idx / num_steps) * 100)
-                current_freq_mhz = freq / 1e6
-                self.scan_progress.emit(progress, f"{current_freq_mhz:.3f} MHz")
-                
-                # Scan this frequency
+                freq = float(peak["frequency"])
+                snr = float(peak.get("snr_db", 0.0))
+                pct = 50 + int(50 * (i + 1) / max(len(peaks), 1))
+                self.scan_progress.emit(pct, f"{freq/1e6:.3f} MHz (vérif)")
+
                 try:
-                    result = self.scanner.scan_frequency(freq, dwell_time=0.2)
-                    
-                    # Check if signal found
-                    if result.get('signal_present', False) or result.get('power_db', -100) > -80:
-                        power = result.get('power_db', -100)
-                        is_tetra = result.get('is_tetra', False)
-                        
-                        if power > -80:
-                            status = "TETRA detected ✓" if is_tetra else "Signal detected"
-                            self.frequency_found.emit(freq, power, status)
-                            found_count += 1
-                
+                    result = self.scanner.scan_frequency(freq, dwell_time=0.35)
                 except Exception as e:
-                    logger.debug(f"Error scanning {freq/1e6:.3f} MHz: {e}")
+                    logger.debug("Verify failed at %.3f: %s", freq / 1e6, e)
                     continue
-            
-            # Final update
+
+                power = float(result.get("power_db", peak.get("power_db", -100)) or -100)
+                is_tetra = bool(result.get("is_tetra", False))
+                confidence = float(result.get("confidence", 0.0) or 0.0)
+                sync = bool(result.get("sync_detected", False))
+                sync_corr = float(result.get("sync_correlation", 0.0) or 0.0)
+
+                if is_tetra and confidence >= 0.30:
+                    status = f"TETRA ✓  SNR {snr:.0f} dB  conf {confidence:.0%}"
+                elif sync and sync_corr >= 0.45:
+                    status = f"Possible TETRA  SNR {snr:.0f} dB  sync {sync_corr:.2f}"
+                elif snr >= 15.0:
+                    # Strong carrier — still useful to tune even if not classified yet
+                    status = f"Porteur fort  SNR {snr:.0f} dB"
+                else:
+                    continue
+
+                self.frequency_found.emit(freq, power, status)
+                found_count += 1
+
             if self.scanning:
-                self.scan_progress.emit(100, f"Complete - Found {found_count} signals")
-            
+                self.scan_progress.emit(100, f"Terminé — {found_count} candidat(s)")
+
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.scan_progress.emit(0, f"Scan error: {str(e)}")
         finally:
-            # Clean up
             if self.scanner and self.scanner.capture:
                 try:
                     self.scanner.capture.close()
-                except:
+                except Exception:
                     pass
             self.scanning = False
-            # Update UI on main thread
             QTimer.singleShot(100, self.scan_finished)
     
     def scan_finished(self):
@@ -1848,6 +2013,12 @@ class CaptureThread(QThread):
         self.pending_freq = None
         self.last_signal_time = 0
         self.encryption_keys = []  # List of keys for bruteforce
+        self.tch_assembler = None
+        self.samples_per_symbol = 1
+        self.demodulated_symbols = None
+        self._decode_error_count = 0
+        # Optional direct sink for Raw FM (bypass Qt GUI queue — keeps audio realtime)
+        self.raw_audio_sink = None
         
     def set_keys(self, keys):
         """Set encryption keys for bruteforce attempts."""
@@ -1858,6 +2029,10 @@ class CaptureThread(QThread):
         
     def set_monitor_raw(self, enabled):
         self.monitor_raw = enabled
+
+    def set_raw_audio_sink(self, sink):
+        """Set a thread-safe callable(audio_float32) for Raw FM (or None)."""
+        self.raw_audio_sink = sink
         
     def set_frequency(self, freq):
         """Set tuning frequency."""
@@ -1899,7 +2074,8 @@ class CaptureThread(QThread):
         import time
         self.running = True
         last_spectrum_update = 0
-        spectrum_update_interval = 0.005  # ~200 Hz (5ms) for ultra-fast updates
+        # 20 Hz max — 200 Hz flooded the GUI thread (choppy waterfall + starved FM ring)
+        spectrum_update_interval = 0.05
         last_status_update = 0
         status_update_interval = 0.1  # 10 Hz for status updates
         
@@ -1929,6 +2105,12 @@ class CaptureThread(QThread):
                 logger.info("No user keys loaded (using common keys only)")
              
             self.voice_processor = VoiceProcessor()
+            try:
+                from tetraear.audio.tch import TchFrameAssembler
+                self.tch_assembler = TchFrameAssembler()
+            except Exception as e:
+                logger.warning("TchFrameAssembler unavailable: %s", e)
+                self.tch_assembler = None
             
             self.status_update.emit(f"✓ Started - {self.frequency/1e6:.3f} MHz")
             
@@ -1949,43 +2131,71 @@ class CaptureThread(QThread):
                     # Read larger chunk to ensure full TETRA frames (which are ~14ms long)
                     # 32k was too small (~13ms), causing frame splitting and decode failure
                     # 128k is ~54ms (at 2.4MSps), containing ~3-4 full frames
+                    # Smaller chunks when Raw FM is on: feed the audio ring often
+                    # enough to keep realtime (128k @ 2.4 MSps ≈ 53 ms, but heavy
+                    # decode after it was starving the ring → thousands of underruns).
+                    read_n = 48 * 1024 if self.monitor_raw else 128 * 1024
                     try:
-                        samples = self.capture.read_samples(128*1024)
+                        samples = self.capture.read_samples(read_n)
                     except RuntimeError as e:
                         # Device error - stop capture
                         self.error_occurred.emit(f"RTL-SDR device error: {e}. Please restart the application.")
                         self.running = False
                         break
-                    
-                    # Compute spectrum with proper windowing
-                    # Use a fixed FFT size for consistent display resolution
+
+                    # Raw FM FIRST — before FFT/demod/decode — so audio tracks the
+                    # SDR clock even when the rest of the pipeline is busy/slow.
+                    if self.monitor_raw and samples is not None and len(samples) > 1:
+                        try:
+                            target_rate = 48000
+                            decimation = max(1, int(round(float(self.sample_rate) / target_rate)))
+                            audio_samples = samples[::decimation]
+                            if len(audio_samples) > 1:
+                                audio = np.angle(audio_samples[1:] * np.conj(audio_samples[:-1]))
+                                audio = np.asarray(audio, dtype=np.float32)
+                                peak = float(np.max(np.abs(audio))) + 1e-9
+                                audio = np.clip(audio / peak * 0.7, -1.0, 1.0)
+                                self._record_raw_audio(audio, target_rate)
+                                # Prefer direct sink (capture thread → ring) so a
+                                # busy Qt GUI cannot delay audio and cause underruns.
+                                sink = getattr(self, "raw_audio_sink", None)
+                                if sink is not None:
+                                    try:
+                                        sink(audio)
+                                    except Exception as sink_err:
+                                        audio_logger.debug("Raw FM sink failed: %s", sink_err)
+                                else:
+                                    self.raw_audio_data.emit(audio)
+                        except Exception as audio_err:
+                            audio_logger.debug("Raw FM demod failed: %s", audio_err)
+
+                    # Spectrum / detect FFT
                     n_fft = 2048
-                    if len(samples) >= n_fft:
-                        # Take a slice for spectrum analysis
+                    current_time = time.time()
+                    power = None
+                    freqs = None
+                    # Raw FM: FFT only for throttled GUI. Decode mode: FFT every chunk for detect.
+                    need_fft = len(samples) >= n_fft and (
+                        not self.monitor_raw
+                        or (current_time - last_spectrum_update) >= spectrum_update_interval
+                    )
+                    if need_fft:
                         fft_samples = samples[:n_fft]
                         window = np.hanning(n_fft)
-                        
-                        # Compute FFT
                         fft = np.fft.fftshift(np.fft.fft(fft_samples * window))
-                        freqs = np.fft.fftshift(np.fft.fftfreq(n_fft, 1/self.sample_rate))
-                        
-                        # Power in dBFS (normalized)
-                        # 20*log10(abs(fft)/N) gives dB relative to full scale sine wave
-                        # Add epsilon to avoid log(0)
+                        freqs = np.fft.fftshift(np.fft.fftfreq(n_fft, 1 / self.sample_rate))
                         power = 20 * np.log10(np.abs(fft) / n_fft + 1e-20)
-                        
-                        # Shift to actual frequency
-                        freqs_actual = freqs + self.frequency
-                        
-                        # Throttle spectrum updates to ~60 Hz for live feel
-                        current_time = time.time()
-                        if current_time - last_spectrum_update >= spectrum_update_interval:
-                            self.spectrum_update.emit(freqs_actual, power)
+                        if (current_time - last_spectrum_update) >= spectrum_update_interval:
+                            self.spectrum_update.emit(freqs + self.frequency, power)
                             last_spectrum_update = current_time
+
+                    # Raw FM listen mode: audio already fed; skip heavy demod this lap
+                    if self.monitor_raw:
+                        continue
                     
                     # Detect signal (using the computed power)
                     signal_present = False
-                    if len(samples) >= n_fft:
+                    if power is not None and len(samples) >= n_fft:
                         # Calculate average power in the center frequency range (TETRA bandwidth)
                         center_idx = len(power) // 2
                         bandwidth_hz = 25000  # 25 kHz TETRA bandwidth
@@ -2052,6 +2262,11 @@ class CaptureThread(QThread):
                                     self.signal_lost.emit()
                                 last_status_update = current_time
                     
+                    # Raw FM mode: skip heavy π/4-DQPSK demod + TETRA decode so the
+                    # read→FM→ring loop can keep realtime. Spectrum still updates above.
+                    if self.monitor_raw:
+                        continue
+
                     # Only attempt to process and decode TETRA frames when signal is actually present
                     # This prevents false positives from noise or non-TETRA signals
                     if signal_present:
@@ -2075,29 +2290,6 @@ class CaptureThread(QThread):
                             # TETRA symbol rate is 18k symbols/sec, so at 180k samples/sec: 10 samples/symbol
                             symbol_rate = 18000  # TETRA symbol rate
                             self.samples_per_symbol = int(self.sample_rate / symbol_rate) if symbol_rate > 0 else 10
-                            
-                            # FM Demodulation for raw audio recording (for offline decoding)
-                            if self.monitor_raw:
-                                try:
-                                    # Record raw FM demodulated audio at 48kHz for TETRA decoding
-                                    # This is the "buzz/rasp" sound that can be processed offline
-                                    target_rate = 48000  # TETRA tools expect 48kHz
-                                    decimation = int(self.sample_rate / target_rate)
-                                    if decimation > 0:
-                                        audio_samples = samples[::decimation]
-                                        if len(audio_samples) > 1:
-                                            # FM demod: angle of product of sample and conjugate of previous sample
-                                            audio = np.angle(audio_samples[1:] * np.conj(audio_samples[:-1]))
-                                            # Normalize volume
-                                            audio = audio / np.pi * 0.5
-                                            
-                                            # Record to WAV file for offline processing
-                                            self._record_raw_audio(audio, target_rate)
-                                            
-                                            # Also emit for monitoring
-                                            self.raw_audio_data.emit(audio)
-                                except Exception as audio_err:
-                                    pass
                         
                             # Decode TETRA frames (only when signal is present)
                             # This prevents false positives from noise or non-TETRA signals
@@ -2108,7 +2300,7 @@ class CaptureThread(QThread):
                                 else:
                                     frames = self.decoder.decode(
                                         demodulated,
-                                        confidences=getattr(self.signal_processor, "symbol_confidence", None),
+                                        confidences=getattr(self.processor, "symbol_confidence", None),
                                     )
                                     # Log when frames are found (but limit logging frequency)
                                     if len(frames) > 0:
@@ -2120,158 +2312,93 @@ class CaptureThread(QThread):
                                             logger.info(f"✓ Decoded {len(frames)} TETRA frame(s) from signal")
                                             self._last_frame_log_time = current_time
                             except Exception as decode_err:
-                                logger.debug(f"Decode error: {decode_err}")
+                                self._decode_error_count = getattr(self, "_decode_error_count", 0) + 1
+                                if self._decode_error_count <= 5 or self._decode_error_count % 500 == 0:
+                                    logger.warning("Decode error: %s", decode_err)
                                 frames = []
                             
-                            # Emit all decoded frames
+                            # Emit all decoded frames; voice only from lower-MAC codec_input
                             for frame in frames:
-                                    # Try to extract and decode voice from frames
                                     try:
-                                        if self.voice_processor and self.voice_processor.working:
-                                            # Check if this might be a voice frame
-                                            # Voice is typically in clear MAC-FRAG frames or Traffic frames
-                                            mac_pdu = frame.get('mac_pdu', {})
-                                            pdu_type = str(mac_pdu.get('type', ''))
-                                            is_encrypted = frame.get('encrypted', False)
-                                            
-                                            # Voice candidates: attempt on any non-broadcast burst.
-                                            # Some traffic bursts are misclassified without full FEC decode.
-                                            is_voice_candidate = frame.get('type_name') != 'MAC-BROADCAST'
-                                            
-                                            if is_voice_candidate:
-                                                # Extract raw bits from the frame
-                                                # TETRA voice is encoded in the payload bits
-                                                voice_bits = None
-                                                
-                                                # Try to get bits from frame
-                                                if 'bits' in frame:
-                                                    voice_bits = frame['bits']
-                                                elif 'mac_pdu' in frame and 'data' in mac_pdu:
-                                                    # Convert MAC data to bits
-                                                    data = mac_pdu['data']
-                                                    if isinstance(data, bytes):
-                                                        # Convert bytes to bit array
-                                                        bit_list = []
-                                                        for byte_val in data:
-                                                            for bit_idx in range(8):
-                                                                bit_list.append((byte_val >> (7 - bit_idx)) & 1)
-                                                        voice_bits = np.array(bit_list, dtype=np.uint8)
-                                                
-                                                # Check if frame is encrypted and decrypted - OVERRIDE bits
-                                                if frame.get('decrypted') and 'decrypted_payload' in frame:
-                                                    try:
-                                                        payload_str = frame['decrypted_payload']
-                                                        # Convert string '0101...' to list of ints
-                                                        voice_bits = np.array([int(b) for b in payload_str], dtype=np.uint8)
-                                                    except Exception as e:
-                                                        logger.debug(f"Error using decrypted payload: {e}")
+                                        codec_input = frame.get("codec_input")
+                                        # Only decode voice after SYNC lock (scrambling known)
+                                        sync_locked = bool(
+                                            self.decoder
+                                            and getattr(self.decoder.lower_mac, "scramb_init", None) is not None
+                                        )
+                                        if (
+                                            codec_input is not None
+                                            and len(codec_input) == 1380
+                                            and sync_locked
+                                            and self.voice_processor
+                                            and self.voice_processor.working
+                                            # Raw FM already skips this whole demod path above; keep the
+                                            # guard for safety. Native in-process decode is cheap, but
+                                            # π/4-DQPSK + lower-MAC still costs CPU vs realtime FM.
+                                            and not self.monitor_raw
+                                        ):
+                                            try:
+                                                import os
+                                                from datetime import datetime
+                                                records_dir = str(RECORDS_DIR)
+                                                os.makedirs(records_dir, exist_ok=True)
+                                                if not getattr(self, "raw_frames_file", None):
+                                                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                                    freq_mhz = self.frequency / 1e6
+                                                    self.raw_frames_file = os.path.join(
+                                                        records_dir,
+                                                        f"tetra_frames_{freq_mhz:.3f}MHz_{timestamp}.bin",
+                                                    )
+                                                    audio_logger.info(
+                                                        "Recording raw frames: %s",
+                                                        os.path.basename(self.raw_frames_file),
+                                                    )
+                                                with open(self.raw_frames_file, "ab") as f:
+                                                    f.write(codec_input)
+                                            except Exception as e:
+                                                logger.debug("Failed to save raw frame: %s", e)
 
-                                                # Prefer decoded codec input from the lower-MAC pipeline.
-                                                codec_input = frame.get("codec_input")
-
-                                                # Fallback to symbol-based extraction for legacy paths.
-                                                if codec_input is None and hasattr(self, 'demodulated_symbols') and self.demodulated_symbols is not None:
-                                                    if self.tch_assembler:
-                                                        codec_input = self.tch_assembler.add_burst(self.demodulated_symbols, frame.get('position'))
-                                                    else:
-                                                        codec_input = self._extract_voice_slot_from_symbols(frame, self.demodulated_symbols, self.samples_per_symbol)
-                                                
-                                                # If extraction from symbols failed, try alternative method
-                                                if codec_input is None and voice_bits is not None and len(voice_bits) >= 432:
-                                                    # Build codec input format from 432 soft bits
-                                                    # cdecoder expects 690 shorts with specific structure
-                                                    import struct
-                                                    
-                                                    # Create 690-short block structure for TETRA ACELP codec
-                                                    # The codec expects quantized ACELP parameters, not raw bits
-                                                    # We need to extract and properly format the codec parameters
-                                                    
-                                                    # TETRA ACELP frame structure (137 bits per subframe, 4 subframes):
-                                                    # - Frame energy: 6 bits
-                                                    # - Pitch delay: 7 bits
-                                                    # - Pitch gain: 3 bits
-                                                    # - Grid index: 2 bits
-                                                    # - 4x Pulse positions: 9 bits each
-                                                    # - 4x Pulse signs: 4 bits
-                                                    # - Adaptive codebook gain: 5 bits
-                                                    # - Fixed codebook gain: 5 bits
-                                                    
-                                                    block = [0] * 690
-                                                    block[0] = 0x6B21  # Header marker
-                                                    
-                                                    # Convert bits to proper codec parameters
-                                                    # Use stronger quantization to generate actual audio
-                                                    # Map voice_bits to ACELP parameter space
-                                                    
-                                                    if len(voice_bits) >= 432:
-                                                        # Process 4 subframes (108 bits each)
-                                                        for subframe in range(4):
-                                                            offset = subframe * 108
-                                                            sub_bits = voice_bits[offset:offset+108]
-                                                            base_idx = 1 + subframe * 172  # Each subframe uses ~172 shorts
-                                                            
-                                                            if len(sub_bits) >= 108:
-                                                                # Extract ACELP parameters from bits
-                                                                # Energy (6 bits) -> scale to codec range
-                                                                energy_bits = sub_bits[0:6]
-                                                                energy = sum(b << i for i, b in enumerate(energy_bits))
-                                                                block[base_idx] = int((energy / 63.0) * 1000) - 500  # Scale to ±500
-                                                                
-                                                                # Pitch delay (7 bits)
-                                                                pitch_bits = sub_bits[6:13]
-                                                                pitch = sum(b << i for i, b in enumerate(pitch_bits))
-                                                                block[base_idx+1] = int((pitch / 127.0) * 200) + 20  # Range: 20-220
-                                                                
-                                                                # Pitch gain (3 bits)
-                                                                gain_bits = sub_bits[13:16]
-                                                                gain = sum(b << i for i, b in enumerate(gain_bits))
-                                                                block[base_idx+2] = int((gain / 7.0) * 150)  # 0-150
-                                                                
-                                                                # Fill remaining with quantized bit values
-                                                                for i, bit in enumerate(sub_bits[16:108]):
-                                                                    if base_idx + 3 + i < 690:
-                                                                        # Use stronger quantization: ±300 instead of ±127
-                                                                        block[base_idx + 3 + i] = 300 if bit else -300
-                                                    
-                                                    # Pack as binary (little-endian signed shorts)
-                                                    codec_input = struct.pack('<' + 'h' * 690, *block)
-                                                
-                                                # Process codec input if we have it
-                                                if codec_input is not None and len(codec_input) == 1380:
-                                                    # Save raw frame to file for debugging/offline processing
-                                                    try:
-                                                        import os
-                                                        from datetime import datetime
-                                                        records_dir = str(RECORDS_DIR)
-                                                        os.makedirs(records_dir, exist_ok=True)
-                                                        
-                                                        # Save with timestamp for easier identification
-                                                        if not hasattr(self, 'raw_frames_file') or not self.raw_frames_file:
-                                                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                                            freq_mhz = self.frequency / 1e6
-                                                            self.raw_frames_file = os.path.join(records_dir, f"tetra_frames_{freq_mhz:.3f}MHz_{timestamp}.bin")
-                                                            audio_logger.info("Recording raw frames: %s", os.path.basename(self.raw_frames_file))
-                                                        
-                                                        with open(self.raw_frames_file, 'ab') as f:  # Append mode
-                                                            f.write(codec_input)
-                                                    except Exception as e:
-                                                        logger.debug(f"Failed to save raw frame: {e}")
-                                                    
-                                                    # Decode with TETRA codec
-                                                    audio_segment = self.voice_processor.decode_frame(codec_input)
-                                                    if len(audio_segment) > 0:
-                                                        self.voice_audio_data.emit(audio_segment)
-                                                        frame['has_voice'] = True
-                                                        logger.info(f"[OK] Decoded voice: {len(audio_segment)} samples from frame {frame.get('number')}")
-                                                        audio_logger.info("Decoded voice: %s samples from frame %s", len(audio_segment), frame.get('number'))
-                                                    else:
-                                                        logger.debug(f"Codec returned empty audio for frame {frame.get('number')}")
-                                                        audio_logger.debug("Codec returned empty audio for frame %s", frame.get('number'))
-                                                else:
-                                                    logger.debug(f"Frame has insufficient data: voice_bits={len(voice_bits) if voice_bits is not None else 0}, codec_input={len(codec_input) if codec_input else 0}")
+                                            audio_segment = self.voice_processor.decode_frame(codec_input)
+                                            raw_peak = float(
+                                                getattr(self.voice_processor, "last_raw_peak", 0.0) or 0.0
+                                            )
+                                            verified = bool(frame.get("voice_verified") or frame.get("is_traffic"))
+                                            # Unverified (no AACH traffic) needs solid raw energy to avoid noise clicks
+                                            accept = len(audio_segment) > 0 and (
+                                                verified or raw_peak >= 0.008
+                                            )
+                                            if accept:
+                                                self.voice_audio_data.emit(audio_segment)
+                                                frame["has_voice"] = True
+                                                logger.debug(
+                                                    "[OK] Decoded voice: %s samples frame=%s verified=%s raw_peak=%.5f",
+                                                    len(audio_segment),
+                                                    frame.get("number"),
+                                                    verified,
+                                                    raw_peak,
+                                                )
+                                                audio_logger.debug(
+                                                    "Decoded voice: %s samples frame=%s verified=%s raw_peak=%.5f",
+                                                    len(audio_segment),
+                                                    frame.get("number"),
+                                                    verified,
+                                                    raw_peak,
+                                                )
+                                            else:
+                                                frame["has_voice"] = False
+                                                self._empty_voice_count = getattr(self, "_empty_voice_count", 0) + 1
+                                                if self._empty_voice_count <= 5 or self._empty_voice_count % 50 == 0:
+                                                    logger.debug(
+                                                        "Codec audio rejected frame=%s verified=%s raw_peak=%.5f len=%s (count=%s)",
+                                                        frame.get("number"),
+                                                        verified,
+                                                        raw_peak,
+                                                        len(audio_segment),
+                                                        self._empty_voice_count,
+                                                    )
                                     except Exception as voice_err:
-                                        logger.debug(f"Voice decode error: {voice_err}")
-                            
+                                        logger.debug("Voice decode error: %s", voice_err)
+
                                     self.frame_decoded.emit(frame)
                             
                             # Don't generate test frames - only show real decoded frames
@@ -2484,6 +2611,10 @@ class ModernTetraGUI(QMainWindow):
         self.signal_present = False  # Track if signal is currently present
         self.first_frame_time = None  # Track when first frame was detected
         self.min_detection_time = 5.0  # Minimum seconds before showing "TETRA Signal Detected"
+        self.cell_mcc = None
+        self.cell_mnc = None
+        self.cell_colour = None
+        self.cell_la = None
         
         # SDS reassembly tracking
         self.sds_fragments = {}  # Key: (src, dst, msg_id), Value: {fragments, timestamp}
@@ -2497,6 +2628,23 @@ class ModernTetraGUI(QMainWindow):
         self.recording_start_time = None
         self.recording_has_audio = False  # Track if valid audio was recorded
         self.tch_assembler = None
+        self._audio_q = queue.Queue(maxsize=64)
+        self._audio_player_stop = threading.Event()
+        self._audio_player_thread = None
+        self._audio_out_rate = 48000
+        self._audio_play_lock = threading.Lock()
+        self.audio_stream = None  # unused legacy; kept for compatibility
+        # Continuous Raw-FM stream (ring + OutputStream) — avoids choppy sd.play bursts
+        self._raw_stream = None
+        self._raw_ring = None
+        self._raw_ring_lock = threading.Lock()
+        self._raw_ring_cap = 0
+        self._raw_ring_data = None
+        self._raw_ring_r = 0
+        self._raw_ring_w = 0
+        self._raw_ring_size = 0
+        self._raw_underruns = 0
+        self._raw_drops = 0
         
         # Managers
         self.settings_manager = SettingsManager()
@@ -2526,44 +2674,8 @@ class ModernTetraGUI(QMainWindow):
         # Initialize audio
         self.init_audio()
 
-        # Auto-size table columns periodically (throttled) so columns fit content.
-        self._autosize_state: dict[str, int] = {}
-        self._autosize_timer = QTimer(self)
-        self._autosize_timer.timeout.connect(self._autosize_tables)
-        self._autosize_timer.start(2000)
-        QTimer.singleShot(0, self._autosize_tables)
-
-    def _autosize_table(self, table: QTableWidget, *, max_width: int = 520) -> None:
-        """Resize columns to fit contents, clamping overly wide columns."""
-        try:
-            table.resizeColumnsToContents()
-            for col in range(table.columnCount()):
-                if table.columnWidth(col) > max_width:
-                    table.setColumnWidth(col, max_width)
-        except Exception:
-            pass
-
-    def _autosize_tables(self) -> None:
-        """Auto-size all tables when row count changes."""
-        tables: list[tuple[str, QTableWidget, int]] = []
-        if hasattr(self, "frames_table"):
-            tables.append(("frames_table", self.frames_table, 600))
-        if hasattr(self, "calls_table"):
-            tables.append(("calls_table", self.calls_table, 320))
-        if hasattr(self, "groups_table"):
-            tables.append(("groups_table", self.groups_table, 320))
-        if hasattr(self, "users_table"):
-            tables.append(("users_table", self.users_table, 360))
-
-        for name, table, cap in tables:
-            try:
-                rows = table.rowCount()
-                if self._autosize_state.get(name) == rows:
-                    continue
-                self._autosize_state[name] = rows
-                self._autosize_table(table, max_width=cap)
-            except Exception:
-                continue
+        # Column widths are fixed/Interactive — do NOT periodically resizeToContents
+        # (that made tables jump every time new frames arrived).
     
     def load_settings(self):
         """Load initial settings."""
@@ -2983,9 +3095,15 @@ class ModernTetraGUI(QMainWindow):
         options_layout.addWidget(self.auto_decrypt_cb)
         
         self.hear_voice_cb = QCheckBox("🔊 Monitor Audio")
-        self.hear_voice_cb.setChecked(False)  # Disable by default
+        self.hear_voice_cb.setChecked(True)
         self.hear_voice_cb.setToolTip("Listen to decoded voice (if available)")
+        self.hear_voice_cb.toggled.connect(self._on_monitor_audio_toggled)
         options_layout.addWidget(self.hear_voice_cb)
+
+        self.test_speaker_btn = QPushButton("Test Speaker")
+        self.test_speaker_btn.setToolTip("Play a short beep on the selected audio output")
+        self.test_speaker_btn.clicked.connect(self._test_speaker)
+        options_layout.addWidget(self.test_speaker_btn)
         
         self.monitor_raw_cb = QCheckBox("📻 Raw Signal (FM)")
         self.monitor_raw_cb.setChecked(False)
@@ -3155,27 +3273,28 @@ class ModernTetraGUI(QMainWindow):
         self.frames_table.setHorizontalHeaderLabels([
             "⏱ Time", "# Frame", "📋 Type", "📝 Description", "💬 Message", "🔐 Encrypted", "✅ Status", "📊 Data", "🌍 Country"
         ])
-        # Column widths with stretch factors
+        # Stable column widths — Interactive so the user can drag; never ResizeToContents
         self.frames_table.setColumnWidth(0, 80)
         self.frames_table.setColumnWidth(1, 70)
-        self.frames_table.setColumnWidth(2, 100)
-        self.frames_table.setColumnWidth(3, 300)
-        self.frames_table.setColumnWidth(4, 240)  # Message column width
-        self.frames_table.setColumnWidth(5, 80)
-        self.frames_table.setColumnWidth(6, 180)
-        self.frames_table.setColumnWidth(7, 250)  # Data column width
-        self.frames_table.setColumnWidth(8, 150)  # Country column width
-        
-        # Set column stretch modes for better scaling
+        self.frames_table.setColumnWidth(2, 120)
+        self.frames_table.setColumnWidth(3, 280)
+        self.frames_table.setColumnWidth(4, 220)
+        self.frames_table.setColumnWidth(5, 90)
+        self.frames_table.setColumnWidth(6, 160)
+        self.frames_table.setColumnWidth(7, 220)
+        self.frames_table.setColumnWidth(8, 140)
+
         header = self.frames_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # Description stretches
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # Message stretches
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)  # Status stretches
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)  # Data stretches
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
         
         # Set table properties
         self.frames_table.setAlternatingRowColors(True)
@@ -3183,9 +3302,13 @@ class ModernTetraGUI(QMainWindow):
         self.frames_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.frames_table.setShowGrid(False)
         self.frames_table.verticalHeader().setVisible(False)
+        self.frames_table.verticalHeader().setDefaultSectionSize(24)
+        self.frames_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.frames_table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self.frames_table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
         self.frames_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.frames_table.setWordWrap(False)
+        self.frames_table.setTextElideMode(Qt.TextElideMode.ElideRight)
         
         # Add tooltips to headers
         headers = ["Time", "Frame #", "Type", "Description", "Message", "Encrypted", "Status", "Data"]
@@ -3243,6 +3366,16 @@ class ModernTetraGUI(QMainWindow):
         self.calls_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.calls_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.calls_table.verticalHeader().setVisible(False)
+        self.calls_table.verticalHeader().setDefaultSectionSize(24)
+        self.calls_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.calls_table.setWordWrap(False)
+        self.calls_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        calls_header = self.calls_table.horizontalHeader()
+        for col in range(10):
+            calls_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        calls_header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        for col, w in enumerate([70, 80, 70, 50, 70, 50, 80, 90, 90, 100]):
+            self.calls_table.setColumnWidth(col, w)
         
         layout.addWidget(self.calls_table)
         widget.setLayout(layout)
@@ -3263,6 +3396,16 @@ class ModernTetraGUI(QMainWindow):
         self.groups_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.groups_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.groups_table.verticalHeader().setVisible(False)
+        self.groups_table.verticalHeader().setDefaultSectionSize(24)
+        self.groups_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.groups_table.setWordWrap(False)
+        self.groups_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        groups_header = self.groups_table.horizontalHeader()
+        for col in range(6):
+            groups_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        groups_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        for col, w in enumerate([90, 90, 50, 60, 60, 70, 200]):
+            self.groups_table.setColumnWidth(col, w)
         
         layout.addWidget(self.groups_table)
         widget.setLayout(layout)
@@ -3295,6 +3438,16 @@ class ModernTetraGUI(QMainWindow):
         self.users_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.users_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.users_table.verticalHeader().setVisible(False)
+        self.users_table.verticalHeader().setDefaultSectionSize(24)
+        self.users_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.users_table.setWordWrap(False)
+        self.users_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        users_header = self.users_table.horizontalHeader()
+        for col in range(6):
+            users_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        users_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        for col, w in enumerate([90, 90, 90, 60, 60, 120, 200]):
+            self.users_table.setColumnWidth(col, w)
         
         layout.addWidget(self.users_table)
         widget.setLayout(layout)
@@ -3583,8 +3736,29 @@ class ModernTetraGUI(QMainWindow):
     
     def on_monitor_raw_toggled(self, checked):
         """Handle raw monitor toggle."""
+        try:
+            self.settings_manager.set("monitor_raw", bool(checked))
+            self.settings_manager.save()
+        except Exception:
+            pass
         if self.capture_thread:
             self.capture_thread.set_monitor_raw(checked)
+        if checked:
+            try:
+                self._start_raw_stream()
+                if self.capture_thread:
+                    self.capture_thread.set_raw_audio_sink(self.feed_raw_fm)
+            except Exception as e:
+                self.log(f"Raw FM stream error: {e}")
+                audio_logger.error("Raw FM stream start failed: %s", e)
+            self.log("Raw Signal FM: ON (flux continu)")
+            audio_logger.info("Raw FM monitor enabled (continuous stream)")
+        else:
+            if self.capture_thread:
+                self.capture_thread.set_raw_audio_sink(None)
+            self._stop_raw_stream()
+            self.log("Raw Signal FM: OFF")
+            audio_logger.info("Raw FM monitor disabled")
 
     def on_auto_decrypt_toggled(self, checked):
         """Handle auto-decrypt toggle."""
@@ -3632,6 +3806,10 @@ class ModernTetraGUI(QMainWindow):
         self.tetra_valid_frames = 0
         self.signal_present = False
         self.first_frame_time = None
+        self.cell_mcc = None
+        self.cell_mnc = None
+        self.cell_colour = None
+        self.cell_la = None
         self.frames_table.setRowCount(0)
         self.calls_table.setRowCount(0)
         self.groups_table.setRowCount(0)
@@ -3862,13 +4040,19 @@ class ModernTetraGUI(QMainWindow):
             else:
                 gain = 50.0  # Default per user specification
             
-            # Get sample rate from slider
-            if hasattr(self, 'sample_rate_slider'):
-                # Value 0 = 1.8 MHz, value 82 = 10.0 MHz
-                slider_value = self.sample_rate_slider.value()
-                sample_rate = (1.8 + slider_value * 0.1) * 1e6
+            # Get sample rate from slider (indexes valid RTL-SDR rates)
+            if hasattr(self, 'sample_rate_slider') and hasattr(self, 'valid_sample_rates'):
+                idx = int(self.sample_rate_slider.value())
+                idx = max(0, min(idx, len(self.valid_sample_rates) - 1))
+                sample_rate = float(self.valid_sample_rates[idx]) * 1e6
             else:
                 sample_rate = 2.4e6  # Default per TETRA spec
+            # Prefer 2.4 MHz for π/4-DQPSK resample to 18 ksym/s
+            if abs(sample_rate - 2.4e6) > 1e3:
+                logger.info(
+                    "Sample rate %.3f MHz selected; 2.4 MHz recommended for TETRA decode",
+                    sample_rate / 1e6,
+                )
             
             self.capture_thread = CaptureThread()
             self.capture_thread.frequency = freq_hz
@@ -3890,9 +4074,21 @@ class ModernTetraGUI(QMainWindow):
             self.capture_thread.voice_audio_data.connect(self.on_voice_audio)
             
             self.capture_thread.start()
+
+            # If Raw FM already checked, attach direct sink now
+            if self.monitor_raw_cb.isChecked():
+                try:
+                    self._start_raw_stream()
+                    self.capture_thread.set_raw_audio_sink(self.feed_raw_fm)
+                except Exception as e:
+                    audio_logger.error("Raw FM autostart failed: %s", e)
             
             # Connect spectrum click signal
             self.waterfall.frequency_clicked.connect(self.on_tune_from_spectrum)
+
+            # Lock listening-channel bars to the started frequency immediately
+            if hasattr(self, "waterfall") and self.waterfall is not None:
+                self.waterfall.set_tuned_frequency(freq_mhz)
             
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
@@ -3908,6 +4104,7 @@ class ModernTetraGUI(QMainWindow):
             self.save_recording()
         
         if self.capture_thread:
+            self.capture_thread.set_raw_audio_sink(None)
             self.capture_thread.stop()
             self.capture_thread.wait()
             self.capture_thread = None
@@ -3999,28 +4196,449 @@ class ModernTetraGUI(QMainWindow):
             "font-weight: bold; padding: 5px; color: #888888;"
         )
     
-    def init_audio(self):
-        """Initialize audio stream."""
+    def _on_monitor_audio_toggled(self, checked: bool):
+        """Persist Monitor Audio checkbox and (re)start the player thread."""
+        self.settings_manager.set("monitor_audio", bool(checked), persist=True)
+        if checked:
+            self._voice_monitor_hint_shown = False
+            self.init_audio()
+            self.log("Monitor Audio activé")
+        else:
+            self._stop_audio_player()
+            self.log("Monitor Audio désactivé — la voix décodée ne sera pas jouée")
+
+    def _resolve_output_device(self):
+        """Pick a concrete output device index (prefer settings, else pulse/default)."""
+        device = self.settings_manager.get("audio_device", None)
+        if device is not None:
+            return device
         try:
-            device = self.settings_manager.get("audio_device", None)
-            self.audio_stream = sd.OutputStream(
-                samplerate=8000,  # TETRA voice is usually 8kHz
-                channels=1,
-                dtype='float32',
-                device=device
+            devices = list(sd.query_devices())
+            # Prefer named hosts that usually reach the desktop speakers
+            for prefer in ("pulse", "default", "pipewire"):
+                for i, info in enumerate(devices):
+                    if info.get("max_output_channels", 0) <= 0:
+                        continue
+                    if prefer in str(info.get("name", "")).lower():
+                        return i
+            defaults = sd.default.device
+            if isinstance(defaults, (list, tuple)) and len(defaults) >= 2 and defaults[1] is not None:
+                if int(defaults[1]) >= 0:
+                    return int(defaults[1])
+            for i, info in enumerate(devices):
+                if info.get("max_output_channels", 0) > 0:
+                    return i
+        except Exception:
+            pass
+        return None
+
+    def _test_speaker(self):
+        """Play a short beep via the audio queue (never call sd.play from the UI thread)."""
+        try:
+            if self._audio_player_thread is None or not self._audio_player_thread.is_alive():
+                self.init_audio()
+            # Generate at 8 kHz — player resamples. Avoid concurrent sd.play (SIGABRT).
+            sr = 8000
+            t = np.linspace(0, 0.35, int(sr * 0.35), endpoint=False)
+            beep = (0.35 * np.sin(2 * np.pi * 880 * t)).astype(np.float32)
+            n = min(len(beep), int(0.02 * sr))
+            if n > 0:
+                beep[:n] *= np.linspace(0, 1, n)
+                beep[-n:] *= np.linspace(1, 0, n)
+            self._enqueue_audio(beep)
+            device = self._resolve_output_device()
+            self.log(f"Test Speaker — bip 880 Hz (device={device})")
+            audio_logger.info("Test speaker beep queued (device=%s)", device)
+        except Exception as e:
+            self.log(f"Test Speaker échoué: {e}")
+            audio_logger.error("Test speaker failed: %s", e)
+
+    def _stop_audio_player(self):
+        """Stop background playback thread."""
+        self._stop_raw_stream()
+        self._audio_player_stop.set()
+        try:
+            self._audio_q.put_nowait(None)  # wake worker
+        except Exception:
+            pass
+        thread = self._audio_player_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._audio_player_thread = None
+
+    def _raw_ring_clear(self):
+        with self._raw_ring_lock:
+            self._raw_ring_r = 0
+            self._raw_ring_w = 0
+            self._raw_ring_size = 0
+
+    def _raw_ring_write(self, samples: np.ndarray) -> None:
+        """Append samples to the raw ring; drop oldest on overflow (keeps realtime)."""
+        if samples is None or samples.size == 0 or self._raw_ring_data is None:
+            return
+        x = np.asarray(samples, dtype=np.float32).reshape(-1)
+        with self._raw_ring_lock:
+            cap = self._raw_ring_cap
+            n = int(x.size)
+            if n >= cap:
+                # Keep only the newest window
+                x = x[-cap:]
+                n = cap
+                self._raw_ring_data[:] = x
+                self._raw_ring_r = 0
+                self._raw_ring_w = 0
+                self._raw_ring_size = n
+                self._raw_drops += 1
+                return
+            free = cap - self._raw_ring_size
+            if n > free:
+                drop = n - free
+                self._raw_ring_r = (self._raw_ring_r + drop) % cap
+                self._raw_ring_size -= drop
+                self._raw_drops += 1
+            # Contiguous write, possibly wrapped
+            first = min(n, cap - self._raw_ring_w)
+            self._raw_ring_data[self._raw_ring_w : self._raw_ring_w + first] = x[:first]
+            second = n - first
+            if second:
+                self._raw_ring_data[:second] = x[first:]
+            self._raw_ring_w = (self._raw_ring_w + n) % cap
+            self._raw_ring_size += n
+
+    def _raw_ring_read(self, n: int) -> np.ndarray:
+        """Read n samples; pad with zeros on underrun."""
+        out = np.zeros(n, dtype=np.float32)
+        if self._raw_ring_data is None or n <= 0:
+            return out
+        with self._raw_ring_lock:
+            have = min(n, self._raw_ring_size)
+            if have <= 0:
+                self._raw_underruns += 1
+                return out
+            cap = self._raw_ring_cap
+            first = min(have, cap - self._raw_ring_r)
+            out[:first] = self._raw_ring_data[self._raw_ring_r : self._raw_ring_r + first]
+            second = have - first
+            if second:
+                out[first:have] = self._raw_ring_data[:second]
+            self._raw_ring_r = (self._raw_ring_r + have) % cap
+            self._raw_ring_size -= have
+            if have < n:
+                self._raw_underruns += 1
+        return out
+
+    def _start_raw_stream(self):
+        """Start a continuous PortAudio OutputStream for Raw FM (no blocking bursts)."""
+        self._stop_raw_stream()
+        device = self._resolve_output_device()
+        out_rate = 48000
+        try:
+            if device is not None:
+                info = sd.query_devices(device, "output")
+                native = int(info.get("default_samplerate") or 48000)
+                if native > 0:
+                    out_rate = native
+        except Exception:
+            pass
+        self._audio_out_rate = out_rate
+        # ~1.5 s ring at device rate — absorbs capture jitter without huge latency
+        cap = max(out_rate * 2, 96000)
+        self._raw_ring_cap = cap
+        self._raw_ring_data = np.zeros(cap, dtype=np.float32)
+        self._raw_ring_clear()
+        self._raw_underruns = 0
+        self._raw_drops = 0
+
+        def _callback(outdata, frames, time_info, status):  # noqa: ARG001
+            if status:
+                audio_logger.debug("Raw stream status: %s", status)
+            samples = self._raw_ring_read(frames)
+            outdata[:, 0] = samples
+
+        stream = sd.OutputStream(
+            samplerate=out_rate,
+            channels=1,
+            dtype="float32",
+            device=device,
+            blocksize=0,  # let PortAudio choose (low latency)
+            latency="low",
+            callback=_callback,
+        )
+        stream.start()
+        self._raw_stream = stream
+        audio_logger.info(
+            "Raw FM continuous stream started (device=%s, rate=%s, ring=%ss)",
+            device,
+            out_rate,
+            cap / out_rate,
+        )
+
+    def _stop_raw_stream(self):
+        stream = getattr(self, "_raw_stream", None)
+        self._raw_stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self._raw_ring_clear()
+        if getattr(self, "_raw_underruns", 0) or getattr(self, "_raw_drops", 0):
+            audio_logger.info(
+                "Raw FM stream stopped (underruns=%s drops=%s)",
+                getattr(self, "_raw_underruns", 0),
+                getattr(self, "_raw_drops", 0),
             )
-            self.audio_stream.start()
+
+    def _append_monitor_wav(self, samples_8k: np.ndarray):
+        """Append decoded 8 kHz float audio to a rolling monitor WAV for offline check.
+
+        Inserts silence for wall-clock gaps so dropped/rejected frames do not
+        glue into a chopped stutter — the timeline stays continuous.
+        """
+        try:
+            import wave
+            import time as _time
+            from datetime import datetime
+
+            if samples_8k is None or len(samples_8k) == 0:
+                return
+            now = _time.monotonic()
+            if not getattr(self, "_monitor_wav", None):
+                records_dir = str(RECORDS_DIR)
+                os.makedirs(records_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                path = os.path.join(records_dir, f"tetra_monitor_{ts}.wav")
+                self._monitor_wav_path = path
+                self._monitor_wav = wave.open(path, "wb")
+                self._monitor_wav.setnchannels(1)
+                self._monitor_wav.setsampwidth(2)
+                self._monitor_wav.setframerate(8000)
+                self._monitor_wav_last_t = now
+                audio_logger.info("Monitor WAV: %s", path)
+                self.log(f"Enregistrement moniteur: {os.path.basename(path)}")
+            else:
+                last_t = getattr(self, "_monitor_wav_last_t", None)
+                if last_t is not None:
+                    gap = now - last_t
+                    # Expected ~60 ms per TCH slot pair; fill only real gaps
+                    if 0.08 < gap < 2.5:
+                        n_sil = int(round(gap * 8000))
+                        if n_sil > 0:
+                            self._monitor_wav.writeframes(
+                                np.zeros(n_sil, dtype=np.int16).tobytes()
+                            )
+            pcm = (np.clip(samples_8k, -1.0, 1.0) * 32767).astype(np.int16)
+            self._monitor_wav.writeframes(pcm.tobytes())
+            self._monitor_wav_last_t = now + (len(samples_8k) / 8000.0)
+        except Exception as e:
+            audio_logger.debug("Monitor WAV write failed: %s", e)
+
+    @staticmethod
+    def _unpack_audio_chunk(chunk):
+        """Normalize queue items to (float32 samples, input_rate_hz)."""
+        if chunk is None:
+            return None, 8000
+        if isinstance(chunk, tuple) and len(chunk) == 2:
+            samples, rate = chunk
+            try:
+                rate = int(rate) if rate else 8000
+            except (TypeError, ValueError):
+                rate = 8000
+            return np.asarray(samples, dtype=np.float32).reshape(-1), max(1000, rate)
+        return np.asarray(chunk, dtype=np.float32).reshape(-1), 8000
+
+    def _audio_player_loop(self, device, out_rate: int):
+        """Drain queued float chunks (any rate), coalesce, play via PortAudio."""
+        import time as _time
+
+        audio_logger.info(
+            "Audio player thread running (device=%s, out_rate=%s)", device, out_rate
+        )
+        while not self._audio_player_stop.is_set():
+            try:
+                chunk = self._audio_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                if self._audio_player_stop.is_set():
+                    break
+                continue
+            try:
+                first, in_rate = self._unpack_audio_chunk(chunk)
+                if first is None or first.size == 0:
+                    continue
+                parts = [first]
+                # Voice (8 kHz): longer coalesce. Raw FM (48 kHz): short, or the
+                # queue floods and playback falls silently behind.
+                if in_rate >= 16000:
+                    deadline = _time.monotonic() + 0.08
+                    extend = 0.04
+                    get_to = 0.04
+                else:
+                    deadline = _time.monotonic() + 0.45
+                    extend = 0.18
+                    get_to = 0.10
+                while _time.monotonic() < deadline and not self._audio_player_stop.is_set():
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        nxt = self._audio_q.get(timeout=min(get_to, remaining))
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        if self._audio_player_stop.is_set():
+                            break
+                        continue
+                    nxt_s, nxt_rate = self._unpack_audio_chunk(nxt)
+                    if nxt_s is None or nxt_s.size == 0:
+                        continue
+                    if nxt_rate != in_rate:
+                        # Different stream (e.g. voice vs raw) — put back and flush current
+                        try:
+                            self._audio_q.put_nowait((nxt_s, nxt_rate))
+                        except queue.Full:
+                            pass
+                        break
+                    parts.append(nxt_s)
+                    deadline = _time.monotonic() + extend
+
+                samples = np.concatenate(parts) if len(parts) > 1 else parts[0]
+                if samples.size == 0:
+                    continue
+                peak = float(np.max(np.abs(samples)))
+                if peak > 0 and peak < 0.25:
+                    samples = np.clip(samples * (0.5 / peak), -1.0, 1.0)
+                    peak = float(np.max(np.abs(samples)))
+
+                # Monitor WAV is 8 kHz voice only — never dump raw FM into it
+                if in_rate == 8000:
+                    self._append_monitor_wav(samples)
+
+                play = samples
+                if out_rate != in_rate:
+                    n_out = max(1, int(round(samples.size * (out_rate / float(in_rate)))))
+                    play = resample(samples, n_out).astype(np.float32)
+
+                with self._audio_play_lock:
+                    sd.play(play, samplerate=out_rate, device=device, blocking=True)
+                audio_logger.debug(
+                    "Played audio: %s chunks, %s samples in=%sHz out=%sHz (peak=%.3f, device=%s)",
+                    len(parts),
+                    play.size,
+                    in_rate,
+                    out_rate,
+                    peak,
+                    device,
+                )
+            except Exception as exc:
+                audio_logger.warning("Audio play failed: %s", exc)
+                try:
+                    self._audio_player_stop.wait(0.2)
+                except Exception:
+                    pass
+        audio_logger.info("Audio player thread stopped")
+
+    def _enqueue_audio(self, data: np.ndarray, sample_rate: int = 8000):
+        """Queue float32 mono samples with their true sample rate for the player."""
+        if data is None or len(data) == 0:
+            return
+        play = np.clip(np.asarray(data, dtype=np.float32).reshape(-1), -1.0, 1.0)
+        item = (play.copy(), int(sample_rate) if sample_rate else 8000)
+        try:
+            self._audio_q.put_nowait(item)
+        except queue.Full:
+            try:
+                _ = self._audio_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._audio_q.put_nowait(item)
+            except queue.Full:
+                audio_logger.debug("Audio queue full — dropping chunk (rate=%s)", sample_rate)
+
+    def init_audio(self):
+        """Start background voice player (8 kHz in → device rate out)."""
+        try:
+            self._stop_audio_player()
+            # Fresh queue after stop
+            self._audio_q = queue.Queue(maxsize=64)
+            self._audio_player_stop = threading.Event()
+
+            device = self._resolve_output_device()
+            out_rate = 48000
+            try:
+                if device is not None:
+                    info = sd.query_devices(device, "output")
+                    native = int(info.get("default_samplerate") or 48000)
+                    if native > 0:
+                        out_rate = native
+            except Exception:
+                pass
+            self._audio_out_rate = out_rate
+
+            self._audio_player_thread = threading.Thread(
+                target=self._audio_player_loop,
+                args=(device, out_rate),
+                name="TetraEarAudio",
+                daemon=True,
+            )
+            self._audio_player_thread.start()
+            audio_logger.info(
+                "Audio player started (device=%s, out_rate=%s)", device, out_rate
+            )
+            self.log(f"Audio OK — sortie {out_rate} Hz (device={device})")
         except Exception as e:
             self.log(f"Audio init error: {e}")
+            audio_logger.error("Audio init error: %s", e)
+
+    def feed_raw_fm(self, data: np.ndarray):
+        """Thread-safe Raw FM → ring (callable from the capture thread)."""
+        if data is None or len(data) == 0:
+            return
+        if not getattr(self, "monitor_raw_cb", None) or not self.monitor_raw_cb.isChecked():
+            return
+        try:
+            if self._raw_stream is None:
+                # Stream must be started on GUI side; ignore until then
+                return
+            x = np.asarray(data, dtype=np.float32).reshape(-1)
+            in_rate = 48000.0
+            out_rate = float(getattr(self, "_audio_out_rate", 48000) or 48000)
+            if abs(out_rate - in_rate) > 1.0 and x.size > 1:
+                n_out = max(1, int(round(x.size * (out_rate / in_rate))))
+                # np.interp is fine here; avoid allocating linspace twice via arange
+                x = np.interp(
+                    np.linspace(0, x.size - 1, n_out, dtype=np.float64),
+                    np.arange(x.size, dtype=np.float64),
+                    x,
+                ).astype(np.float32)
+            self._raw_ring_write(x)
+            n = getattr(self, "_raw_audio_play_count", 0) + 1
+            self._raw_audio_play_count = n
+            if n <= 3 or n % 500 == 0:
+                with self._raw_ring_lock:
+                    fill = self._raw_ring_size
+                    cap = self._raw_ring_cap
+                audio_logger.info(
+                    "Raw FM ring write: %s samples (peak=%.3f, fill=%.0f%%, underrun=%s drop=%s)",
+                    x.size,
+                    float(np.max(np.abs(x))) if x.size else 0.0,
+                    100.0 * fill / max(cap, 1),
+                    self._raw_underruns,
+                    self._raw_drops,
+                )
+        except Exception as e:
+            audio_logger.warning("Raw FM ring write failed: %s", e)
 
     @pyqtSlot(np.ndarray)
     def on_raw_audio(self, data):
-        """Play raw audio data."""
-        if hasattr(self, 'audio_stream') and self.audio_stream and self.monitor_raw_cb.isChecked():
-            try:
-                self.audio_stream.write(data.astype(np.float32))
-            except Exception:
-                pass
+        """Fallback path if no direct sink is attached."""
+        self.feed_raw_fm(data)
 
     @pyqtSlot(np.ndarray)
     def on_voice_audio(self, data):
@@ -4033,78 +4651,74 @@ class ModernTetraGUI(QMainWindow):
         if len(data) == 0:
             return
             
-        max_amp = np.max(np.abs(data))
+        max_amp = float(np.max(np.abs(data)))
         if max_amp <= 0:
             return  # Skip silent/invalid frames
         
         # Continuous recording to single WAV file
-        if len(data) > 0:
-            try:
-                # Convert float32 to int16
-                audio_int16 = (data * 32767).astype(np.int16)
+        try:
+            # Convert float32 to int16
+            audio_int16 = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+            
+            # Start new recording if not active
+            if self.recording_enabled and not self.recording_active:
+                records_dir = str(RECORDS_DIR)
+                os.makedirs(records_dir, exist_ok=True)
                 
-                # Start new recording if not active
-                if self.recording_enabled and not self.recording_active:
-                    records_dir = str(RECORDS_DIR)
-                    os.makedirs(records_dir, exist_ok=True)
-                    
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    freq_mhz = float(self.freq_input.text())
-                    self.current_wav_file = os.path.join(records_dir, f"tetra_voice_{freq_mhz:.3f}MHz_{timestamp}.wav")
-                    
-                    # Open WAV file for writing
-                    self.wav_file = wave.open(self.current_wav_file, 'wb')
-                    self.wav_file.setnchannels(1)
-                    self.wav_file.setsampwidth(2)
-                    self.wav_file.setframerate(8000)
-                    
-                    self.recording_active = True
-                    self.recording_start_time = datetime.now()
-                    self.recording_has_audio = False
-                    self.log(f"🎙️ Recording: {os.path.basename(self.current_wav_file)}")
-                    audio_logger.info("Started voice recording: %s", self.current_wav_file)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                freq_mhz = float(self.freq_input.text())
+                self.current_wav_file = os.path.join(records_dir, f"tetra_voice_{freq_mhz:.3f}MHz_{timestamp}.wav")
                 
-                # Write to continuous WAV file
-                if self.recording_active and hasattr(self, 'wav_file'):
-                    self.wav_file.writeframes(audio_int16.tobytes())
-                    self.recording_has_audio = True
+                # Open WAV file for writing
+                self.wav_file = wave.open(self.current_wav_file, 'wb')
+                self.wav_file.setnchannels(1)
+                self.wav_file.setsampwidth(2)
+                self.wav_file.setframerate(8000)
                 
-            except Exception as e:
-                audio_logger.debug("Failed to record voice: %s", e)
+                self.recording_active = True
+                self.recording_start_time = datetime.now()
+                self.recording_has_audio = False
+                self.log(f"🎙️ Recording: {os.path.basename(self.current_wav_file)}")
+                audio_logger.info("Started voice recording: %s", self.current_wav_file)
+            
+            # Write to continuous WAV file
+            if self.recording_active and hasattr(self, 'wav_file'):
+                self.wav_file.writeframes(audio_int16.tobytes())
+                self.recording_has_audio = True
+            
+        except Exception as e:
+            audio_logger.debug("Failed to record voice: %s", e)
         
         # Play audio LIVE if monitoring enabled
-        if self.hear_voice_cb.isChecked() and len(data) > 0:
-            play_data = np.clip(data.astype(np.float32), -1.0, 1.0)
+        if not self.hear_voice_cb.isChecked():
+            if not getattr(self, "_voice_monitor_hint_shown", False):
+                self._voice_monitor_hint_shown = True
+                self.log("Voix décodée reçue — coche « Monitor Audio » pour l'écouter")
+                audio_logger.info("Decoded voice arrived but Monitor Audio is off")
+            return
+
+        # Raw FM uses an exclusive continuous OutputStream — don't fight it with
+        # bursty voice playback (that was a major source of choppy FM).
+        if self.monitor_raw_cb.isChecked() and self._raw_stream is not None:
+            return
+
+        try:
+            if self._audio_player_thread is None or not self._audio_player_thread.is_alive():
+                self.init_audio()
+            self._enqueue_audio(data)
+            audio_logger.info(
+                "Queued voice for playback: %s samples (max_amp=%.4f, q=%s)",
+                len(data),
+                max_amp,
+                self._audio_q.qsize(),
+            )
+        except Exception as e:
+            audio_logger.debug("Audio enqueue error: %s", e)
             try:
-                # Ensure audio stream exists and is started
-                if not hasattr(self, 'audio_stream') or self.audio_stream is None:
-                    self.init_audio()
-                
-                if hasattr(self, 'audio_stream') and self.audio_stream:
-                    # Check if stream is active, restart if needed
-                    if not self.audio_stream.active:
-                        try:
-                            self.audio_stream.stop()
-                        except:
-                            pass
-                        self.audio_stream.start()
-                    
-                    # Write audio data - YOU WILL HEAR THIS LIVE!
-                    self.audio_stream.write(play_data)
-            except Exception as e:
-                logger.debug(f"Audio playback error: {e}")
-                # Try to reinitialize audio stream
-                try:
-                    if hasattr(self, 'audio_stream') and self.audio_stream:
-                        try:
-                            self.audio_stream.stop()
-                        except:
-                            pass
-                    self.init_audio()
-                    if hasattr(self, 'audio_stream') and self.audio_stream:
-                        self.audio_stream.write(play_data)
-                except Exception as e2:
-                    logger.debug(f"Audio reinit failed: {e2}")
+                self.init_audio()
+                self._enqueue_audio(data)
+            except Exception as e2:
+                audio_logger.debug("Audio reinit failed: %s", e2)
 
     def save_recording(self):
         """Close current recording file."""
@@ -4276,93 +4890,112 @@ class ModernTetraGUI(QMainWindow):
         
         return None
 
+    def _row_matches_filter(self, row: int, filter_type: str | None = None, decrypted_only: bool | None = None) -> bool:
+        """Return True if frames_table row should be visible under current filters."""
+        if filter_type is None:
+            filter_type = self.type_filter.currentText().lower()
+        else:
+            filter_type = filter_type.lower()
+        if decrypted_only is None:
+            decrypted_only = self.decrypted_only_cb.isChecked()
+
+        type_item = self.frames_table.item(row, 2)
+        if not type_item:
+            return False
+
+        type_text = type_item.text().lower()
+        visible = True
+
+        if decrypted_only:
+            status_item = self.frames_table.item(row, 6)
+            data_item = self.frames_table.item(row, 7)
+            message_item = self.frames_table.item(row, 4)
+            encrypted_item = self.frames_table.item(row, 5)
+
+            is_clear_frame = encrypted_item and encrypted_item.text().strip().lower() in ["no", "clear"]
+            is_successfully_decrypted = (
+                status_item
+                and ("✅" in status_item.text() or "decrypted" in status_item.text().lower())
+                and "encrypted" not in status_item.text().lower()
+            )
+
+            has_readable_text = False
+            text_candidates = []
+            if message_item and message_item.text().strip():
+                text_candidates.append(message_item.text())
+            if data_item and data_item.text().strip():
+                text_candidates.append(data_item.text())
+            for candidate in text_candidates:
+                if "[BIN-ENC]" in candidate or "SDS (Binary/Encrypted)" in candidate:
+                    continue
+                if any(marker in candidate for marker in ["[TXT]", "[SDS-1]", "[SDS-GSM]", "[GSM7]", "📝", "💬", "🧩"]):
+                    clean_text = candidate
+                    for marker in ["[TXT]", "[SDS-1]", "[SDS-GSM]", "[GSM7]", "📝", "💬", "🧩", "\""]:
+                        clean_text = clean_text.replace(marker, "")
+                    clean_text = clean_text.strip()
+                    if len(clean_text) >= 3 and any(c.isalpha() for c in clean_text):
+                        hex_chars = sum(1 for c in clean_text if c in "0123456789abcdefABCDEF ")
+                        if hex_chars / len(clean_text) < 0.8:
+                            has_readable_text = True
+                            break
+
+            visible = bool(is_clear_frame or is_successfully_decrypted or has_readable_text)
+            if visible and encrypted_item and "yes" in encrypted_item.text().lower():
+                visible = bool(is_successfully_decrypted or has_readable_text)
+
+        if not visible:
+            return False
+
+        if filter_type.startswith("all"):
+            return True
+
+        data_item = self.frames_table.item(row, 7)
+        data_text = data_item.text().lower() if data_item else ""
+        desc_item = self.frames_table.item(row, 3)
+        desc_text = desc_item.text().lower() if desc_item else ""
+        message_item = self.frames_table.item(row, 4)
+        message_text = message_item.text().lower() if message_item else ""
+
+        if "traffic" in filter_type:
+            # Traffic channel / voice; type_name is often MAC-FRAG not "Traffic"
+            return (
+                "traffic" in type_text
+                or "voice" in data_text
+                or "tch" in type_text
+                or "mac-frag" in type_text
+            )
+        if "control" in filter_type:
+            return any(
+                key in type_text
+                for key in ("control", "resource", "u-signal", "mac-end", "mac-data", "suppl")
+            )
+        if "broadcast" in filter_type:
+            return "broadcast" in type_text
+        if filter_type.strip() == "mac" or filter_type.startswith("mac"):
+            return "mac" in type_text
+        if "sds" in filter_type:
+            return (
+                "sds" in type_text
+                or "data" in type_text
+                or "suppl" in type_text
+                or "sns" in type_text
+                or "sds" in desc_text
+                or "text" in desc_text
+                or "sds" in message_text
+                or "text" in message_text
+                or "[bin" in message_text
+            )
+        if "audio" in filter_type:
+            return "voice" in data_text or "audio" in data_text
+
+        return True
+
     def apply_filter(self, text):
-        """Apply type filter to existing rows."""
-        filter_type = text.lower()
+        """Apply type filter to all rows (existing and newly inserted)."""
+        filter_type = text.lower() if text else self.type_filter.currentText().lower()
         decrypted_only = self.decrypted_only_cb.isChecked()
-        
         for row in range(self.frames_table.rowCount()):
-            type_item = self.frames_table.item(row, 2)
-            if not type_item:
-                continue
-            
-            type_text = type_item.text().lower()
-            visible = True
-            
-            # Check decrypted/text only filter
-            if decrypted_only:
-                status_item = self.frames_table.item(row, 6)
-                data_item = self.frames_table.item(row, 7)
-                message_item = self.frames_table.item(row, 4)
-                desc_item = self.frames_table.item(row, 3)
-                encrypted_item = self.frames_table.item(row, 5)  # Encrypted column
-                
-                # STRICT filter: Only show frames that are:
-                # 1. Explicitly marked as "No" in Encrypted column (clear frames)
-                # 2. Successfully decrypted (status contains "✅" or "Decrypted")
-                # 3. Have readable text content (not "[BIN-ENC]" or binary)
-                
-                is_clear_frame = encrypted_item and encrypted_item.text().strip().lower() in ["no", "clear"]
-                is_successfully_decrypted = status_item and ("✅" in status_item.text() or "decrypted" in status_item.text().lower()) and "encrypted" not in status_item.text().lower()
-                
-                # Check if data contains readable text (not binary/encrypted markers)
-                has_readable_text = False
-                text_candidates = []
-                if message_item and message_item.text().strip():
-                    text_candidates.append(message_item.text())
-                if data_item and data_item.text().strip():
-                    text_candidates.append(data_item.text())
-                for candidate in text_candidates:
-                    if "[BIN-ENC]" in candidate or "SDS (Binary/Encrypted)" in candidate:
-                        continue
-                    if any(marker in candidate for marker in ["[TXT]", "[SDS-1]", "[SDS-GSM]", "[GSM7]", "📝", "💬", "🧩"]):
-                        clean_text = candidate
-                        for marker in ["[TXT]", "[SDS-1]", "[SDS-GSM]", "[GSM7]", "📝", "💬", "🧩", "\""]:
-                            clean_text = clean_text.replace(marker, "")
-                        clean_text = clean_text.strip()
-                        if len(clean_text) >= 3 and any(c.isalpha() for c in clean_text):
-                            hex_chars = sum(1 for c in clean_text if c in "0123456789abcdefABCDEF ")
-                            if hex_chars / len(clean_text) < 0.8:
-                                has_readable_text = True
-                                break
-                
-                # STRICT: Only show if clear OR successfully decrypted OR has readable text
-                visible = is_clear_frame or is_successfully_decrypted or has_readable_text
-                
-                # Extra validation: if showing encrypted frame, must have been decrypted
-                if visible and encrypted_item and "yes" in encrypted_item.text().lower():
-                    # Encrypted frame - only show if successfully decrypted
-                    visible = is_successfully_decrypted or has_readable_text
-            
-            if visible:
-                if "traffic" in filter_type and "traffic" not in type_text:
-                    visible = False
-                elif "control" in filter_type and "control" not in type_text:
-                    visible = False
-                elif "broadcast" in filter_type and "broadcast" not in type_text:
-                    visible = False
-                elif "mac" in filter_type and "mac" not in type_text and "traffic" not in type_text and "control" not in type_text and "broadcast" not in type_text:
-                    visible = False
-                elif "sds" in filter_type:
-                    has_sds = "sds" in type_text or "data" in type_text or "suppl" in type_text or "sns" in type_text
-                    # Also check description for "SDS" or "Text"
-                    desc_item = self.frames_table.item(row, 3)
-                    if desc_item and ("sds" in desc_item.text().lower() or "text" in desc_item.text().lower()):
-                        has_sds = True
-                    message_item = self.frames_table.item(row, 4)
-                    if message_item and ("sds" in message_item.text().lower() or "text" in message_item.text().lower() or "[bin" in message_item.text().lower()):
-                        has_sds = True
-                        
-                    if not has_sds:
-                        visible = False
-                elif "audio" in filter_type:
-                    # Check for voice/audio
-                    data_item = self.frames_table.item(row, 7)
-                    if data_item and "voice" in data_item.text().lower():
-                        visible = True
-                    else:
-                        visible = False
-                
+            visible = self._row_matches_filter(row, filter_type, decrypted_only)
             self.frames_table.setRowHidden(row, not visible)
 
     def apply_calls_filter(self):
@@ -4613,44 +5246,45 @@ class ModernTetraGUI(QMainWindow):
         """Handle decoded frame."""
         self.frame_count += 1
 
-        # Always log each decoded frame (even if UI filters hide it).
-        try:
-            import json
+        # Per-frame JSONL only with --debug (default off — huge I/O otherwise).
+        if _DEBUG_FRAME_LOG:
+            try:
+                import json
 
-            frames_logger.info(
-                json.dumps(
-                    {
-                        "event": "frame_decoded",
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                        "frame_number": frame.get("number"),
-                        "type": frame.get("type"),
-                        "type_name": frame.get("type_name"),
-                        "encrypted": bool(frame.get("encrypted")),
-                        "encryption_algorithm": frame.get("encryption_algorithm"),
-                        "decrypted": bool(frame.get("decrypted")),
-                        "decryption_attempted": bool(frame.get("decryption_attempted")),
-                        "keys_tried": frame.get("keys_tried"),
-                        "best_score": frame.get("best_score"),
-                        "best_key": frame.get("best_key"),
-                        "key_used": frame.get("key_used"),
-                        "decrypt_confidence": frame.get("decrypt_confidence"),
-                        "decryption_error": frame.get("decryption_error"),
-                        "additional_info": frame.get("additional_info", {}),
-                        "sds_message": frame.get("sds_message"),
-                        "decoded_text": frame.get("decoded_text"),
-                        "has_voice": bool(frame.get("has_voice")),
-                    },
-                    ensure_ascii=False,
+                frames_logger.info(
+                    json.dumps(
+                        {
+                            "event": "frame_decoded",
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "frame_number": frame.get("number"),
+                            "type": frame.get("type"),
+                            "type_name": frame.get("type_name"),
+                            "encrypted": bool(frame.get("encrypted")),
+                            "encryption_algorithm": frame.get("encryption_algorithm"),
+                            "decrypted": bool(frame.get("decrypted")),
+                            "decryption_attempted": bool(frame.get("decryption_attempted")),
+                            "keys_tried": frame.get("keys_tried"),
+                            "best_score": frame.get("best_score"),
+                            "best_key": frame.get("best_key"),
+                            "key_used": frame.get("key_used"),
+                            "decrypt_confidence": frame.get("decrypt_confidence"),
+                            "decryption_error": frame.get("decryption_error"),
+                            "additional_info": frame.get("additional_info", {}),
+                            "sds_message": frame.get("sds_message"),
+                            "decoded_text": frame.get("decoded_text"),
+                            "has_voice": bool(frame.get("has_voice")),
+                        },
+                        ensure_ascii=False,
+                    )
                 )
-            )
-        except Exception:
-            pass
+            except Exception:
+                pass
         
         # VALIDATE FRAME: Check if this is real TETRA
         is_valid, confidence, issues = self.signal_validator.validate_frame(frame)
         
         if not is_valid:
-            # Log invalid frames but don't display them
+            # Log invalid frames but don't display them / don't pollute Groups
             logger.debug(f"Invalid TETRA frame: confidence={confidence:.1%}, issues={issues}")
             return  # Skip this frame
         
@@ -4682,16 +5316,32 @@ class ModernTetraGUI(QMainWindow):
             if frame.get('position') is not None:
                 self.tetra_sync_count += 1
             
-            # Check for valid CRC (indicates valid frame structure)
-            if frame.get('burst_crc') is True:
+            # Check for valid CRC (prefer real lower-MAC crc_ok)
+            if frame.get('crc_ok') is True:
+                self.tetra_valid_frames += 1
+            elif frame.get('burst_crc') is True:
                 self.tetra_valid_frames += 1
             elif frame.get('decrypted') or frame.get('bypass_clear'):
-                # Decrypted frames are strong evidence of valid TETRA
                 self.tetra_valid_frames += 1
-            elif 'burst_crc' not in frame and frame.get('type') is not None:
-                # Frame was decoded even without explicit CRC - count as valid
-                # Having a frame type means the decoder successfully parsed it
-                self.tetra_valid_frames += 1  # Count as full valid frame, not 0.5
+
+            # Cell lock from SYNC SB1 / SYSINFO
+            info = frame.get("additional_info") or {}
+            if frame.get("mcc") is not None:
+                self.cell_mcc = frame.get("mcc")
+            elif info.get("mcc") is not None:
+                self.cell_mcc = info.get("mcc")
+            if frame.get("mnc") is not None:
+                self.cell_mnc = frame.get("mnc")
+            elif info.get("mnc") is not None:
+                self.cell_mnc = info.get("mnc")
+            if frame.get("colour_code") is not None:
+                self.cell_colour = frame.get("colour_code")
+            elif info.get("colour_code") is not None:
+                self.cell_colour = info.get("colour_code")
+            if frame.get("location_area") is not None:
+                self.cell_la = frame.get("location_area")
+            elif info.get("location_area") is not None:
+                self.cell_la = info.get("location_area")
             
             # Track when first frame was detected
             if self.tetra_frame_count == 1:
@@ -4719,21 +5369,11 @@ class ModernTetraGUI(QMainWindow):
         if frame.get('decrypted'):
             self.decrypted_count += 1
         
-        # Check filter before adding
         type_name = frame.get('type_name', "Unknown")
-        filter_text = self.type_filter.currentText().lower()
-        if "traffic" in filter_text and "traffic" not in type_name.lower():
-            return
-        if "control" in filter_text and "control" not in type_name.lower():
-            return
-        if "broadcast" in filter_text and "broadcast" not in type_name.lower():
-            return
-        if "sds" in filter_text:
-            # SDS can be in MAC-DATA, MAC-SUPPL, or just have an SDS message attached
-            has_sds = "sds" in type_name.lower() or "data" in type_name.lower() or "suppl" in type_name.lower() or 'sds_message' in frame or "sns" in type_name.lower()
-            if not has_sds:
-                return
-            
+        # Cap table size — unbounded growth under CRC-fail floods can OOM/abort
+        max_rows = 2000
+        while self.frames_table.rowCount() >= max_rows:
+            self.frames_table.removeRow(0)
         row = self.frames_table.rowCount()
         self.frames_table.insertRow(row)
         
@@ -5027,36 +5667,44 @@ class ModernTetraGUI(QMainWindow):
         
         self.frames_table.setItem(row, 8, create_item(country_str))
 
-        # Persist full frames table row to dedicated JSONL log.
+        # Apply current type / decrypted filters to this new row (same rules as existing ones)
         try:
-            import json
-
-            frames_logger.info(
-                json.dumps(
-                    {
-                        "time": time_str,
-                        "frame_number": frame.get("number"),
-                        "type": type_name,
-                        "description": desc,
-                        "message": message_text,
-                        "encrypted": bool(frame.get("encrypted")),
-                        "encryption_algorithm": frame.get("encryption_algorithm"),
-                        "decrypted": bool(frame.get("decrypted")),
-                        "status": status_text,
-                        "data": data_str,
-                        "keys_tried": frame.get("keys_tried"),
-                        "best_score": frame.get("best_score"),
-                        "best_key": frame.get("best_key"),
-                        "key_used": frame.get("key_used"),
-                        "decrypt_confidence": frame.get("decrypt_confidence"),
-                        "sds_message": frame.get("sds_message"),
-                        "decoded_text": frame.get("decoded_text"),
-                    },
-                    ensure_ascii=False,
-                )
-            )
+            visible = self._row_matches_filter(row)
+            self.frames_table.setRowHidden(row, not visible)
         except Exception:
             pass
+
+        # Persist full frames table row to JSONL only in --debug mode.
+        if _DEBUG_FRAME_LOG:
+            try:
+                import json
+
+                frames_logger.info(
+                    json.dumps(
+                        {
+                            "time": time_str,
+                            "frame_number": frame.get("number"),
+                            "type": type_name,
+                            "description": desc,
+                            "message": message_text,
+                            "encrypted": bool(frame.get("encrypted")),
+                            "encryption_algorithm": frame.get("encryption_algorithm"),
+                            "decrypted": bool(frame.get("decrypted")),
+                            "status": status_text,
+                            "data": data_str,
+                            "keys_tried": frame.get("keys_tried"),
+                            "best_score": frame.get("best_score"),
+                            "best_key": frame.get("best_key"),
+                            "key_used": frame.get("key_used"),
+                            "decrypt_confidence": frame.get("decrypt_confidence"),
+                            "sds_message": frame.get("sds_message"),
+                            "decoded_text": frame.get("decoded_text"),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            except Exception:
+                pass
         
         # Auto-scroll
         if self.autoscroll_cb.isChecked():
@@ -5080,47 +5728,38 @@ class ModernTetraGUI(QMainWindow):
         self.waterfall.update_spectrum(freqs, powers)
         if self.auto_spectrum_enabled:
             self._apply_auto_spectrum(freqs, powers)
-        # Update tuned frequency display
+        # Do NOT re-read freq_input here: mid-edit / post-Tune text can move the
+        # listening bars off-screen or clear them. Bars follow the last committed
+        # Tune/Start (and AFC below) only.
         try:
-            freq_mhz = float(self.freq_input.text())
-            self.waterfall.set_tuned_frequency(freq_mhz)
-            
+            # Prefer committed listening frequency; fall back to input if unset
+            if getattr(self.waterfall, "tuned_freq", None) is not None:
+                freq_mhz = float(self.waterfall.tuned_freq)
+            else:
+                freq_mhz = float(self.freq_input.text())
+                self.waterfall.set_tuned_frequency(freq_mhz)
+
             # Auto-follow frequency logic (AFC)
             if hasattr(self, 'follow_freq_cb') and self.follow_freq_cb.isChecked():
-                # Find peak within +/- 10 kHz of current center frequency
-                # This ensures we stay locked to the TETRA channel
-                center_idx = np.abs(freqs - freq_mhz).argmin()
-                
-                # Define search window (e.g., +/- 10 kHz)
-                # freqs are in MHz
-                window_width_mhz = 0.010
-                mask = np.abs(freqs - freq_mhz) < window_width_mhz
-                
+                # Spectrum freqs are in Hz; compare in Hz.
+                freq_hz = freq_mhz * 1e6
+                window_width_hz = 10_000.0  # ±10 kHz
+                mask = np.abs(freqs - freq_hz) < window_width_hz
+
                 if np.any(mask):
-                    # Find peak in this window
                     window_indices = np.where(mask)[0]
-                    if len(window_indices) > 0:
-                        peak_idx_in_window = np.argmax(powers[window_indices])
-                        peak_idx = window_indices[peak_idx_in_window]
-                        
-                        peak_freq = freqs[peak_idx]
-                        peak_power = powers[peak_idx]
-                        
-                        # Only adjust if signal is strong enough (e.g., > -60 dB)
-                        # and offset is significant (> 50 Hz) but small (< 10 kHz)
-                        offset = peak_freq - freq_mhz
-                        
-                        if peak_power > -60 and abs(offset) > 0.00005: # 50 Hz
-                            # Apply small correction (10% of offset) to smooth movement
-                            # This centers the "TETRA spike"
-                            new_freq = freq_mhz + (offset * 0.1)
-                            
-                            # Update UI and thread
-                            self.freq_input.setText(f"{new_freq:.6f}")
-                            if self.capture_thread:
-                                # Use set_frequency to update running SDR
-                                self.capture_thread.set_frequency(int(new_freq * 1e6))
-        except:
+                    peak_idx = window_indices[int(np.argmax(powers[window_indices]))]
+                    peak_freq_hz = float(freqs[peak_idx])
+                    peak_power = float(powers[peak_idx])
+                    offset_hz = peak_freq_hz - freq_hz
+
+                    if peak_power > -60 and abs(offset_hz) > 50.0:
+                        new_freq_mhz = freq_mhz + (offset_hz * 0.1) / 1e6
+                        self.freq_input.setText(f"{new_freq_mhz:.6f}")
+                        self.waterfall.set_tuned_frequency(new_freq_mhz)
+                        if self.capture_thread:
+                            self.capture_thread.set_frequency(int(new_freq_mhz * 1e6))
+        except Exception:
             pass
     
     def update_displays(self):
@@ -5219,9 +5858,20 @@ class ModernTetraGUI(QMainWindow):
             (sync_rate > 0.2 or crc_rate > 0.3 or self.tetra_frame_count >= 10)  # Lower threshold or many frames
         )
         
+        cell_bits = []
+        if self.cell_mcc is not None:
+            cell_bits.append(f"MCC {self.cell_mcc}")
+        if self.cell_mnc is not None:
+            cell_bits.append(f"MNC {self.cell_mnc}")
+        if self.cell_colour is not None:
+            cell_bits.append(f"CC {self.cell_colour}")
+        if self.cell_la is not None:
+            cell_bits.append(f"LA {self.cell_la}")
+        cell_str = (" | " + " ".join(cell_bits)) if cell_bits else ""
+
         if high_confidence:
             self.tetra_status_label.setText(
-                f"🟢 TETRA Signal Detected ({self.tetra_frame_count} frames, Sync: {sync_rate:.0%}, CRC: {crc_rate:.0%})"
+                f"🟢 TETRA Signal Detected ({self.tetra_frame_count} frames, Sync: {sync_rate:.0%}, CRC: {crc_rate:.0%}){cell_str}"
             )
             self.tetra_status_label.setStyleSheet(
                 "font-weight: bold; padding: 5px; color: #00ff00; background-color: #002200;"
@@ -5229,7 +5879,7 @@ class ModernTetraGUI(QMainWindow):
         elif is_tetra_detected:
             # Medium confidence: some frames decoded
             self.tetra_status_label.setText(
-                f"🟡 TETRA Detected ({self.tetra_frame_count} frames, Sync: {sync_rate:.0%}, CRC: {crc_rate:.0%})"
+                f"🟡 TETRA Detected ({self.tetra_frame_count} frames, Sync: {sync_rate:.0%}, CRC: {crc_rate:.0%}){cell_str}"
             )
             self.tetra_status_label.setStyleSheet(
                 "font-weight: bold; padding: 5px; color: #ffaa00; background-color: #221100;"
@@ -5391,6 +6041,7 @@ Examples:
   %(prog)s -d 1 --no-gui -f 392.225     # Use RTL-SDR device index 1
   %(prog)s -d 00000001 -f 392.225       # Use RTL-SDR by serial number
   %(prog)s --scan 390 392               # Scan range first, then launch GUI
+  %(prog)s --debug                      # Verbose logs + per-frame JSONL
         '''
     )
     
@@ -5410,16 +6061,20 @@ Examples:
                         help='Scan frequency range first (in MHz)')
     parser.add_argument('--auto-decrypt', action='store_true', default=True,
                         help='Enable auto-decryption (default: enabled)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Debug logging: DEBUG files + one JSONL line per decoded frame')
     parser.add_argument('-v', '--verbose', action='store_true',
-                        help='Enable verbose logging')
+                        help='Same as --debug')
     parser.add_argument('--no-gui', action='store_true',
                         help='Run in CLI mode without GUI')
     
     args = parser.parse_args()
 
-    log_files = _setup_logging(verbose=bool(args.verbose))
-    logger.info("Logging to: %s", _get_log_dir())
-    logger.debug("Log files: %s", {k: str(v) for k, v in log_files.items()})
+    debug = bool(args.debug or args.verbose)
+    log_files = _setup_logging(debug=debug)
+    logger.info("Logging to: %s%s", _get_log_dir(), " (debug)" if debug else "")
+    if debug:
+        logger.debug("Log files: %s", {k: str(v) for k, v in log_files.items()})
     
     # Scan if requested
     if args.scan:
@@ -5471,7 +6126,9 @@ Examples:
             print()
     
     if args.no_gui:
-        from PyQt6.QtCore import QCoreApplication
+        import signal as _signal
+        from PyQt6.QtCore import QCoreApplication, QTimer
+        
         app = QCoreApplication(sys.argv)
         
         # Set UTF-8 encoding for Windows console
@@ -5485,6 +6142,7 @@ Examples:
         print(f"Sample Rate: {args.sample_rate} MHz")
         if args.device is not None:
             print(f"SDR Device: {args.device}")
+        print(f"{Fore.YELLOW}Ctrl+C to stop{Style.RESET_ALL}")
         
         capture_thread = CaptureThread()
         capture_thread.frequency = args.frequency * 1e6
@@ -5495,15 +6153,36 @@ Examples:
         
         listener = CLITetraListener(capture_thread)
         
+        def _shutdown(*_args):
+            print(f"\n{Fore.YELLOW}Stopping...{Style.RESET_ALL}")
+            try:
+                capture_thread.stop()
+            except Exception:
+                pass
+            app.quit()
+
+        # QCoreApplication.exec() does not raise KeyboardInterrupt on its own:
+        # install SIGINT/SIGTERM and poke the event loop so Python can run handlers.
+        _signal.signal(_signal.SIGINT, _shutdown)
+        try:
+            _signal.signal(_signal.SIGTERM, _shutdown)
+        except (AttributeError, ValueError):
+            pass
+        _sig_timer = QTimer()
+        _sig_timer.start(200)
+        _sig_timer.timeout.connect(lambda: None)
+        
         capture_thread.start()
         
         try:
-            sys.exit(app.exec())
-        except KeyboardInterrupt:
-            print(f"\n{Fore.YELLOW}Stopping...{Style.RESET_ALL}")
-            capture_thread.stop()
-            capture_thread.wait()
-            sys.exit(0)
+            rc = app.exec()
+        finally:
+            try:
+                capture_thread.stop()
+                capture_thread.wait(3000)
+            except Exception:
+                pass
+        sys.exit(rc)
             
     else:
         # Create Qt application

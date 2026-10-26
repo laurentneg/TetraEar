@@ -17,11 +17,23 @@ from pathlib import Path
 # Codec paths
 TETRAEAR_ROOT = Path(__file__).resolve().parents[1]
 CODEC_DIR = str(TETRAEAR_ROOT / "tetra_codec" / "bin")
+CODEC_LIB_DIR = TETRAEAR_ROOT / "tetra_codec" / "lib"
+
+
+def _resolve_exe(name: str) -> str:
+    """Prefer native Linux binaries, then Windows .exe copies."""
+    for candidate in (name, f"{name}.exe"):
+        path = os.path.join(CODEC_DIR, candidate)
+        if os.path.exists(path):
+            return path
+    return os.path.join(CODEC_DIR, name)
+
+
 CODECS = {
-    'cdecoder': os.path.join(CODEC_DIR, 'cdecoder.exe'),
-    'ccoder': os.path.join(CODEC_DIR, 'ccoder.exe'),
-    'sdecoder': os.path.join(CODEC_DIR, 'sdecoder.exe'),
-    'scoder': os.path.join(CODEC_DIR, 'scoder.exe'),
+    "cdecoder": _resolve_exe("cdecoder"),
+    "ccoder": _resolve_exe("ccoder"),
+    "sdecoder": _resolve_exe("sdecoder"),
+    "scoder": _resolve_exe("scoder"),
 }
 
 def test_codec_exists(codec_name, codec_path):
@@ -351,40 +363,106 @@ def test_scoder():
         except:
             pass
 
+def test_native_codec():
+    """Test in-process libtetra_cdec + mbelib-neo path."""
+    print("\n" + "=" * 60)
+    print("Testing native codec (libtetra_cdec + mbelib-neo)")
+    print("=" * 60)
+
+    cdec = CODEC_LIB_DIR / "libtetra_cdec.so"
+    mbe = CODEC_LIB_DIR / "libmbe-neo.so"
+    if not cdec.exists():
+        print(f"  [FAIL] {cdec} missing — run scripts/install_tetra_codec.sh")
+        return False
+    if not mbe.exists() and not (CODEC_LIB_DIR / "libmbe-neo.so.2").exists():
+        print(f"  [FAIL] libmbe-neo.so missing under {CODEC_LIB_DIR}")
+        return False
+    print(f"  [OK] libs present under {CODEC_LIB_DIR}")
+
+    try:
+        from tetraear.audio.native_codec import NativeTetraCodec
+        from tetraear.audio.voice import VoiceProcessor
+    except Exception as e:
+        print(f"  [FAIL] import: {e}")
+        return False
+
+    # Prefer a real capture block if available
+    records = sorted(
+        (TETRAEAR_ROOT.parent / "records").glob("tetra_frames_*.bin"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if records:
+        frame = records[0].read_bytes()[:1380]
+        print(f"  Using capture block from {records[0].name}")
+    else:
+        frame = create_tetra_frame_binary()
+        print("  Using synthetic soft-bit block (no records/*.bin)")
+
+    try:
+        native = NativeTetraCodec()
+        audio = native.decode_tch_block(frame)
+        bfi1, bfi2 = native.last_bfi
+        print(f"  Native decode: samples={audio.size} bfi={bfi1}/{bfi2} peak={native.last_raw_peak:.5f}")
+        native.close()
+        if audio.size not in (0, 480):
+            print(f"  [FAIL] unexpected sample count {audio.size} (want 0 or 480)")
+            return False
+        # BFI concealment must still produce 480 samples for a valid-sized block
+        if len(frame) == 1380 and audio.size != 480:
+            print("  [FAIL] expected 480 PCM samples (including BFI concealment)")
+            return False
+        print("  [OK] native decode_tch_block")
+
+        vp = VoiceProcessor(prefer_native=True)
+        if not vp.native:
+            print("  [FAIL] VoiceProcessor did not select native path")
+            return False
+        audio2 = vp.decode_frame(frame)
+        print(f"  VoiceProcessor native: samples={audio2.size} peak={vp.last_raw_peak:.5f}")
+        print("  [OK] VoiceProcessor prefers native")
+        return True
+    except Exception as e:
+        print(f"  [FAIL] native decode error: {e}")
+        return False
+
+
 def main():
     """Run all codec tests."""
-    print("="*60)
+    print("=" * 60)
     print("TETRA Codec Verification")
-    print("="*60)
-    
+    print("=" * 60)
+
     results = {}
-    
-    # Test all codecs
-    results['cdecoder'] = test_cdecoder()
-    results['ccoder'] = test_ccoder()
-    results['sdecoder'] = test_sdecoder()
-    results['scoder'] = test_scoder()
-    
-    # Summary
-    print("\n" + "="*60)
+
+    results["native"] = test_native_codec()
+    results["cdecoder"] = test_cdecoder()
+    results["ccoder"] = test_ccoder()
+    results["sdecoder"] = test_sdecoder()
+    results["scoder"] = test_scoder()
+
+    print("\n" + "=" * 60)
     print("Test Summary")
-    print("="*60)
-    
+    print("=" * 60)
+
     all_passed = True
+    # Native + channel/speech decoders are required; coder tools are optional.
+    required = {"native", "cdecoder", "sdecoder"}
     for codec_name, passed in results.items():
         status = "[PASS]" if passed else "[FAIL]"
-        print(f"  {codec_name:12} : {status}")
-        if not passed:
+        optional = "" if codec_name in required else " (optional)"
+        print(f"  {codec_name:12} : {status}{optional}")
+        if not passed and codec_name in required:
             all_passed = False
-    
-    print("="*60)
-    
+
+    print("=" * 60)
+
     if all_passed:
-        print("\n[SUCCESS] All codecs verified successfully!")
+        print("\n[SUCCESS] Required codecs verified successfully!")
         return 0
-    else:
-        print("\n[FAIL] Some codecs failed verification")
-        return 1
+    print("\n[FAIL] Some required codecs failed verification")
+    return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
